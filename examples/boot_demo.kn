@@ -1,0 +1,32 @@
+struct Point:
+    x: int
+    y: int
+
+fn distance(p1: Point, p2: Point) -> int:
+    return abs(p1.x - p2.x) + abs(p1.y - p2.y)
+
+fn fizzbuzz(n: int):
+    for i in 1..n + 1:
+        if i % 15 == 0:
+            print("fizzbuzz")
+        elif i % 3 == 0:
+            print("fizz")
+        elif i % 5 == 0:
+            print("buzz")
+        else:
+            print(i)
+
+unsafe fn write_vga(addr: int, byte: int):
+    raw_write(addr, byte)
+
+fn main():
+    print("Hello from Kernel! (.kn)")
+
+    let p1 = Point(x: 0, y: 0)
+    let p2 = Point(x: 3, y: 4)
+    print("distance:", distance(p1, p2))
+
+    fizzbuzz(15)
+
+    unsafe:
+        write_vga(757504, 35)

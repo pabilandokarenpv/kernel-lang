@@ -26,11 +26,43 @@ fn main():
   Python-speed iteration while writing, `kernel build` for an optimized,
   freestanding compiled binary.
 
-## Status: v1, early build
+## Status: v1 — COMPLETE, boots in QEMU
 
-Current: hand-written lexer with full indentation tracking (Indent/Dedent/
-Newline tokens), see `src/lexer.rs`. Next: parser → AST → typecheck →
-ownership analysis → Kernel IR → C codegen (v1's backend).
+Full pipeline verified end to end: lexer → parser → AST → ownership/safety
+checker → tree-walking interpreter (dev mode) → C codegen → `gcc`/`as`/`ld`
+→ a real freestanding x86 binary → boots in QEMU → produces pixel-exact
+correct output matching the interpreter, including a `raw_write` MMIO write
+landing on the precise byte address specified.
+
+```
+$ kernel run examples/boot_demo.kn      # dev-mode interpreter
+$ kernel build examples/boot_demo.kn out.bin   # compiles to a bootable binary
+$ qemu-system-i386 -kernel out.bin       # boots it for real
+```
+
+What's real and tested:
+- `src/lexer.rs` — indentation tracking (Indent/Dedent/Newline)
+- `src/parser.rs` + `src/ast.rs` — full recursive-descent parser for the core
+  subset (functions, structs, if/elif/else, while, for-in-range, `unsafe`)
+- `src/checker.rs` — move/ownership checking (verified: rejects
+  use-after-move) + unsafe-block enforcement (verified: rejects unsafe ops
+  outside `unsafe`)
+- `src/interpreter.rs` — tree-walking dev-mode execution
+- `src/codegen_c.rs` + `kernel_runtime/` — C backend, VGA text-mode runtime,
+  multiboot1 boot glue, boots a real kernel binary in QEMU
+
+Documented v1 scope limitations (not silent gaps):
+- move-checking doesn't merge across if/elif/else/loop branches yet (each
+  branch is checked in its own scope snapshot) — real control-flow-merged
+  analysis is a v1.x refinement
+- no simultaneous mutable/immutable borrow-conflict detection yet (the hard
+  20% of a real borrow checker)
+- generics/traits/enums/pattern-matching/closures aren't implemented in the
+  interpreter/codegen yet — they exist in the syntax spec for LLM-corpus
+  variety and get added incrementally when building that corpus generator
+- AST lowers straight to C (no separate Kernel IR yet) — deliberate, a formal
+  pluggable-backend IR only earns its keep once there's a second backend
+  (LLVM, v2) to validate it against
 
 ## Roadmap
 

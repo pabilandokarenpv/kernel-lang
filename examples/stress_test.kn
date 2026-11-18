@@ -1,0 +1,58 @@
+struct Point:
+    x: int
+    y: int
+
+fn distance(p1: Point, p2: Point) -> int:
+    return abs(p1.x - p2.x) + abs(p1.y - p2.y)
+
+fn sum_to(n: int) -> int:
+    let mut total = 0
+    for i in 0..n:
+        total += i
+    return total
+
+fn countdown(n: int):
+    let mut c = n
+    while c > 0:
+        print(c)
+        c -= 1
+
+fn classify(n: int) -> str:
+    if n < 0:
+        return "negative"
+    elif n == 0:
+        return "zero"
+    else:
+        return "positive"
+
+fn fizzbuzz(n: int):
+    for i in 1..n + 1:
+        if i % 15 == 0:
+            print("fizzbuzz")
+        elif i % 3 == 0:
+            print("fizz")
+        elif i % 5 == 0:
+            print("buzz")
+        else:
+            print(i)
+
+unsafe fn write_vga(addr: int, byte: int):
+    raw_write(addr, byte)
+
+fn main():
+    let p1 = Point(x: 0, y: 0)
+    let p2 = Point(x: 3, y: 4)
+    print(distance(p1, p2))
+
+    print(sum_to(5))
+
+    countdown(3)
+
+    print(classify(-5))
+    print(classify(0))
+    print(classify(7))
+
+    fizzbuzz(15)
+
+    unsafe:
+        write_vga(47872, 72)

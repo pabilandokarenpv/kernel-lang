@@ -34,6 +34,10 @@ fn main() {
             let out = args.get(3).map(|s| s.as_str()).unwrap_or("kernel.bin");
             cmd_build(path, out);
         }
+        Some("trace") => {
+            let path = args.get(2).map(|s| s.as_str()).unwrap_or("examples/hello.kn");
+            cmd_trace(path);
+        }
         Some(p) => cmd_run(p),
         None => cmd_run("examples/hello.kn"),
     }
@@ -69,6 +73,40 @@ fn cmd_run(path: &str) {
     let mut interp = Interpreter::new();
     interp.load(&program);
     interp.run_main();
+    for line in &interp.output {
+        println!("{}", line);
+    }
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn json_str_array(items: &[String]) -> String {
+    let parts: Vec<String> = items.iter().map(|s| format!("\"{}\"", json_escape(s))).collect();
+    format!("[{}]", parts.join(","))
+}
+
+fn cmd_trace(path: &str) {
+    let program = load_checked(path);
+    let mut interp = Interpreter::new();
+    interp.load(&program);
+    let final_value = interp.run_main();
+    println!(
+        "{{\"output\":{},\"trace\":{},\"final_value\":\"{}\"}}",
+        json_str_array(&interp.output),
+        json_str_array(&interp.trace),
+        json_escape(&final_value.to_string())
+    );
 }
 
 fn cmd_build(path: &str, out: &str) {

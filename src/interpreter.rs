@@ -51,7 +51,8 @@ pub struct Interpreter {
     structs: HashMap<String, StructDecl>,
     globals: HashMap<String, Value>,
     scopes: Vec<HashMap<String, Value>>,
-    pub trace: Vec<String>, // execution trace, used later for the LLM corpus
+    pub trace: Vec<String>,  // execution trace: lets, assigns, branches taken
+    pub output: Vec<String>, // captured `print` lines (one entry per print statement)
 }
 
 impl Interpreter {
@@ -62,6 +63,7 @@ impl Interpreter {
             globals: HashMap::new(),
             scopes: Vec::new(),
             trace: Vec::new(),
+            output: Vec::new(),
         }
     }
 
@@ -271,7 +273,7 @@ impl Interpreter {
                         CallArg::Named(_, e) => self.eval(e).to_string(),
                     })
                     .collect();
-                println!("{}", parts.join(" "));
+                self.output.push(parts.join(" "));
                 return Value::Unit;
             }
             "abs" => {
@@ -290,7 +292,7 @@ impl Interpreter {
                         CallArg::Named(_, e) => self.eval(e),
                     })
                     .collect();
-                println!("[unsafe raw_write] {:?}", vals);
+                self.output.push(format!("[unsafe raw_write] {:?}", vals));
                 return Value::Unit;
             }
             _ => {}

@@ -1,0 +1,2 @@
+fn main():
+    raw_write(47872, 72)   # ERROR: unsafe call outside an `unsafe` block

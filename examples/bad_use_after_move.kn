@@ -1,0 +1,15 @@
+struct Point:
+    x: int
+    y: int
+
+fn take(p: Point):
+    print(p.x)
+
+fn peek(p: &Point):
+    print(p.x)
+
+fn main():
+    let origin = Point(x: 0, y: 0)
+    peek(&origin)         # borrow, origin still usable after
+    take(origin)          # move, origin is gone after this line
+    take(origin)          # ERROR: use of moved value

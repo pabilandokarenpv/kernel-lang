@@ -1,13 +1,16 @@
 mod ast;
+mod checker;
 mod interpreter;
 mod lexer;
 mod parser;
 
+use checker::Checker;
 use interpreter::Interpreter;
 use lexer::Lexer;
 use parser::Parser;
 use std::env;
 use std::fs;
+use std::process;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -34,6 +37,16 @@ fn main() {
     }
 
     let program = Parser::new(tokens).parse_program();
+
+    let errors = Checker::new(&program).check(&program);
+    if !errors.is_empty() {
+        eprintln!("error: Kernel safety check failed in {}:\n", path);
+        for e in &errors {
+            eprintln!("  {}", e);
+        }
+        process::exit(1);
+    }
+
     let mut interp = Interpreter::new();
     interp.load(&program);
     interp.run_main();

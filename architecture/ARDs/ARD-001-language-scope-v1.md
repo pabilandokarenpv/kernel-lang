@@ -1,4 +1,4 @@
-# ARD-001: v1 scope is int-only, no generics/traits/enums/pattern-matching/closures
+# ARD-001: v1 scope — int/float/str/C-style-enums only, no generics/traits/pattern-matching/closures yet
 
 **Status:** Accepted
 **Date:** 2026 (kernel-lang v1)
@@ -26,11 +26,15 @@ v1 ships with exactly: functions, structs, `if/elif/else`, `while`,
 types (string concatenation via `+`/`+=`, and float arithmetic/comparison/
 `abs`/unary negation, all verified working identically in both the
 interpreter and the compiled-to-QEMU path — see `examples/string_concat.kn`
-and `examples/floats.kn`). No generics, traits, enums, pattern matching,
-or closures in the interpreter or codegen for v1 — even though some of
-this syntax is already *specified* in the grammar (for corpus-generator
-variety down the line), it is not implemented in the
-checker/interpreter/codegen.
+and `examples/floats.kn`), and C-style enums (`enum Color: Red Green Blue`
+desugars at parse time into flat named int constants — `examples/enums.kn`,
+also verified both paths). No generics, traits, pattern matching, or
+closures in the interpreter or codegen for v1, and no Rust-style enums
+with associated data/tagged unions (deliberately out of scope — the
+desugared C-style version gives real ergonomics without that larger
+lift) — even though richer syntax is already *specified* in the grammar
+(for corpus-generator variety down the line), it is not implemented in
+the checker/interpreter/codegen.
 
 ## Alternatives considered
 

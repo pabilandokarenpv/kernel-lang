@@ -112,10 +112,49 @@ impl Parser {
         let mut items = Vec::new();
         self.skip_newlines();
         while !self.check(&Token::Eof) {
-            items.push(self.parse_item());
+            if self.check(&Token::Enum) {
+                items.extend(self.parse_enum_desugared());
+            } else {
+                items.push(self.parse_item());
+            }
             self.skip_newlines();
         }
         Program { items }
+    }
+
+    /// `enum Color:` / `    Red` / `    Green` desugars to plain `const`
+    /// int items (`const Red: int = 0`, `const Green: int = 1`, ...) —
+    /// deliberately C-style (a named integer constant, no associated
+    /// data/tagged union) so it needs zero changes to the checker,
+    /// interpreter, or codegen: those already handle `Item::Const`
+    /// correctly, an enum variant just IS an int under the hood. Full
+    /// Rust-style enums with associated data and pattern matching remain
+    /// out of v1's scope (ARD-001) — this gives real enum ergonomics
+    /// (named constants, no magic numbers) without that larger lift.
+    fn parse_enum_desugared(&mut self) -> Vec<Item> {
+        self.expect(Token::Enum);
+        let _name = self.ident(); // the enum's own name isn't needed once desugared to flat consts
+        self.expect(Token::Colon);
+        self.expect(Token::Newline);
+        self.expect(Token::Indent);
+        let mut items = Vec::new();
+        let mut next_value: i64 = 0;
+        loop {
+            self.skip_newlines();
+            if self.check(&Token::Dedent) {
+                break;
+            }
+            let variant_name = self.ident();
+            items.push(Item::Const {
+                name: variant_name,
+                ty: "int".to_string(),
+                value: Expr::Int(next_value),
+            });
+            next_value += 1;
+            self.skip_newlines();
+        }
+        self.expect(Token::Dedent);
+        items
     }
 
     fn parse_item(&mut self) -> Item {

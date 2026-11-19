@@ -1,0 +1,14 @@
+enum Color:
+    Red
+    Green
+    Blue
+
+fn main():
+    let c = Green
+    print(c)
+    if c == Green:
+        print(1)
+    else:
+        print(0)
+    print(Red)
+    print(Blue)

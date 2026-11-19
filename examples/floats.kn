@@ -1,0 +1,15 @@
+fn main():
+    let pi = 3.14
+    let half = 0.5
+    print(pi)
+    print(pi + half)
+    print(pi - half)
+    print(pi * 2.0)
+    print(pi / 2.0)
+    let neg = -pi
+    print(neg)
+    print(abs(neg))
+    if pi > 3.0:
+        print(1)
+    else:
+        print(0)

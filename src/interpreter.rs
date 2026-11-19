@@ -12,6 +12,7 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Int(i64),
+    Float(f64),
     Str(String),
     Bool(bool),
     Struct(String, HashMap<String, Value>),
@@ -22,6 +23,12 @@ impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Int(n) => write!(f, "{}", n),
+            // fixed 2-decimal-place formatting — chosen specifically so it
+            // can be matched exactly by the freestanding C runtime's
+            // kernel_print_float (no printf/libm available there), rather
+            // than Rust's shortest-roundtrip float formatting which has no
+            // simple freestanding-C equivalent.
+            Value::Float(x) => write!(f, "{:.2}", x),
             Value::Str(s) => write!(f, "{}", s),
             Value::Bool(b) => write!(f, "{}", b),
             Value::Struct(name, fields) => {
@@ -151,7 +158,7 @@ impl Interpreter {
                     AssignOp::Sub => {
                         let cur = self.get_var(name);
                         let rhs = self.eval(value);
-                        binop_int(&cur, &rhs, |a, b| a - b)
+                        eval_binop(&cur, BinOp::Sub, &rhs)
                     }
                 };
                 self.trace.push(format!("{} = {}", name, new_val));
@@ -233,6 +240,7 @@ impl Interpreter {
     fn eval(&mut self, expr: &Expr) -> Value {
         match expr {
             Expr::Int(n) => Value::Int(*n),
+            Expr::Float(x) => Value::Float(*x),
             Expr::Str(s) => Value::Str(s.clone()),
             Expr::Bool(b) => Value::Bool(*b),
             Expr::Ident(name) => self.get_var(name),
@@ -240,7 +248,13 @@ impl Interpreter {
             Expr::Unary(op, e) => {
                 let v = self.eval(e);
                 match op {
-                    UnaryOp::Neg => Value::Int(-as_int(&v)),
+                    UnaryOp::Neg => {
+                        if is_float_val(&v) {
+                            Value::Float(-as_float(&v))
+                        } else {
+                            Value::Int(-as_int(&v))
+                        }
+                    }
                     UnaryOp::Not => Value::Bool(!truthy(&v)),
                 }
             }
@@ -279,7 +293,11 @@ impl Interpreter {
             "abs" => {
                 if let Some(CallArg::Positional(e)) = args.first() {
                     let v = self.eval(e);
-                    return Value::Int(as_int(&v).abs());
+                    return if is_float_val(&v) {
+                        Value::Float(as_float(&v).abs())
+                    } else {
+                        Value::Int(as_int(&v).abs())
+                    };
                 }
             }
             "raw_write" => {
@@ -354,28 +372,38 @@ fn as_int(v: &Value) -> i64 {
     }
 }
 
-fn binop_int(a: &Value, b: &Value, f: impl Fn(i64, i64) -> i64) -> Value {
-    Value::Int(f(as_int(a), as_int(b)))
+fn as_float(v: &Value) -> f64 {
+    match v {
+        Value::Float(n) => *n,
+        Value::Int(n) => *n as f64,
+        other => panic!("Kernel interpreter: expected float, found {:?}", other),
+    }
+}
+
+fn is_float_val(v: &Value) -> bool {
+    matches!(v, Value::Float(_))
 }
 
 fn eval_binop(l: &Value, op: BinOp, r: &Value) -> Value {
     use BinOp::*;
+    let is_float_op = is_float_val(l) || is_float_val(r);
     match op {
         Add => match (l, r) {
-            (Value::Int(a), Value::Int(b)) => Value::Int(a + b),
             (Value::Str(a), Value::Str(b)) => Value::Str(format!("{}{}", a, b)),
+            _ if is_float_op => Value::Float(as_float(l) + as_float(r)),
+            (Value::Int(a), Value::Int(b)) => Value::Int(a + b),
             _ => panic!("Kernel interpreter: `+` type mismatch"),
         },
-        Sub => Value::Int(as_int(l) - as_int(r)),
-        Mul => Value::Int(as_int(l) * as_int(r)),
-        Div => Value::Int(as_int(l) / as_int(r)),
+        Sub => if is_float_op { Value::Float(as_float(l) - as_float(r)) } else { Value::Int(as_int(l) - as_int(r)) },
+        Mul => if is_float_op { Value::Float(as_float(l) * as_float(r)) } else { Value::Int(as_int(l) * as_int(r)) },
+        Div => if is_float_op { Value::Float(as_float(l) / as_float(r)) } else { Value::Int(as_int(l) / as_int(r)) },
         Mod => Value::Int(as_int(l) % as_int(r)),
         Eq => Value::Bool(l == r),
         NotEq => Value::Bool(l != r),
-        Lt => Value::Bool(as_int(l) < as_int(r)),
-        Gt => Value::Bool(as_int(l) > as_int(r)),
-        LtEq => Value::Bool(as_int(l) <= as_int(r)),
-        GtEq => Value::Bool(as_int(l) >= as_int(r)),
+        Lt => if is_float_op { Value::Bool(as_float(l) < as_float(r)) } else { Value::Bool(as_int(l) < as_int(r)) },
+        Gt => if is_float_op { Value::Bool(as_float(l) > as_float(r)) } else { Value::Bool(as_int(l) > as_int(r)) },
+        LtEq => if is_float_op { Value::Bool(as_float(l) <= as_float(r)) } else { Value::Bool(as_int(l) <= as_int(r)) },
+        GtEq => if is_float_op { Value::Bool(as_float(l) >= as_float(r)) } else { Value::Bool(as_int(l) >= as_int(r)) },
         And => Value::Bool(truthy(l) && truthy(r)),
         Or => Value::Bool(truthy(l) || truthy(r)),
     }

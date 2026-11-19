@@ -68,7 +68,7 @@ impl Checker {
 
     fn is_copy_expr(&self, expr: &Expr, scope: &HashMap<String, VarState>) -> bool {
         match expr {
-            Expr::Int(_) | Expr::Str(_) | Expr::Bool(_) => true,
+            Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) => true,
             Expr::Ident(name) => scope.get(name).map(|s| s.copy).unwrap_or(true),
             Expr::Binary(..) | Expr::Unary(..) | Expr::Field(..) | Expr::Borrow(..) | Expr::Range(..) => true,
             Expr::Call { name, .. } => {
@@ -150,7 +150,7 @@ impl Checker {
 
     fn check_expr(&mut self, expr: &Expr, scope: &mut HashMap<String, VarState>, unsafe_ctx: bool, fn_name: &str) {
         match expr {
-            Expr::Int(_) | Expr::Str(_) | Expr::Bool(_) => {}
+            Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) => {}
             Expr::Ident(name) => {
                 if let Some(state) = scope.get(name) {
                     if state.moved {

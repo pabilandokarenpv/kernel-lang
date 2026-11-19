@@ -46,6 +46,7 @@ impl Codegen {
     fn c_type(&self, ty: &str) -> String {
         match ty.trim_start_matches('&').trim() {
             "int" => "long".to_string(),
+            "float" => "double".to_string(),
             "str" => "const char*".to_string(),
             "bool" => "bool".to_string(),
             other if self.structs.contains(other) => format!("struct {}", other),
@@ -63,6 +64,7 @@ impl Codegen {
     fn infer_c_type(&self, expr: &Expr, var_types: &HashMap<String, String>) -> String {
         match expr {
             Expr::Int(_) => "long".to_string(),
+            Expr::Float(_) => "double".to_string(),
             Expr::Str(_) => "const char*".to_string(),
             Expr::Bool(_) => "bool".to_string(),
             Expr::Binary(l, BinOp::Add, r) => {
@@ -70,15 +72,33 @@ impl Codegen {
                 let rt = self.infer_c_type(r, var_types);
                 if lt == "const char*" && rt == "const char*" {
                     "const char*".to_string()
+                } else if lt == "double" || rt == "double" {
+                    "double".to_string()
                 } else {
                     "long".to_string()
                 }
             }
-            Expr::Binary(..) | Expr::Unary(..) => "long".to_string(),
+            Expr::Binary(l, BinOp::Sub | BinOp::Mul | BinOp::Div, r) => {
+                let lt = self.infer_c_type(l, var_types);
+                let rt = self.infer_c_type(r, var_types);
+                if lt == "double" || rt == "double" {
+                    "double".to_string()
+                } else {
+                    "long".to_string()
+                }
+            }
+            Expr::Binary(..) => "long".to_string(),
+            Expr::Unary(UnaryOp::Neg, inner) => self.infer_c_type(inner, var_types),
+            Expr::Unary(..) => "long".to_string(),
             Expr::Field(..) => "long".to_string(), // v1: only primitive fields are read this way
             Expr::Ident(name) => var_types.get(name).cloned().unwrap_or_else(|| "long".to_string()),
             Expr::Borrow(_) | Expr::Range(..) => "long".to_string(),
-            Expr::Call { name, .. } => {
+            Expr::Call { name, args } => {
+                if name == "abs" {
+                    return args.first().map(|a| match a {
+                        CallArg::Positional(e) | CallArg::Named(_, e) => self.infer_c_type(e, var_types),
+                    }).unwrap_or_else(|| "long".to_string());
+                }
                 if self.structs.contains(name) {
                     format!("struct {}", name)
                 } else if let Some(f) = self.functions.get(name) {
@@ -100,10 +120,12 @@ impl Codegen {
         out.push_str("void kernel_print_char(char c);\n");
         out.push_str("void kernel_print_str(const char *s);\n");
         out.push_str("void kernel_print_long(long n);\n");
+        out.push_str("void kernel_print_float(double x);\n");
         out.push_str("void kernel_print_bool(bool b);\n");
         out.push_str("void kernel_print_space(void);\n");
         out.push_str("void kernel_print_newline(void);\n");
         out.push_str("long kernel_abs(long x);\n");
+        out.push_str("double kernel_fabs(double x);\n");
         out.push_str("const char *kernel_strcat(const char *a, const char *b);\n\n");
 
         // struct definitions
@@ -218,6 +240,7 @@ impl Codegen {
     fn expr(&self, e: &Expr, is_ptr: &HashMap<String, bool>, var_types: &HashMap<String, String>) -> String {
         match e {
             Expr::Int(n) => n.to_string(),
+            Expr::Float(x) => format!("{:.2}", x),
             Expr::Str(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
             Expr::Bool(b) => (if *b { "true" } else { "false" }).to_string(),
             Expr::Ident(name) => name.clone(),
@@ -254,7 +277,14 @@ impl Codegen {
         match name {
             "abs" => {
                 let a = args.first().map(|a| self.call_arg(a, is_ptr, var_types)).unwrap_or_default();
-                format!("kernel_abs({})", a)
+                let arg_ty = args.first().and_then(|a| match a {
+                    CallArg::Positional(e) | CallArg::Named(_, e) => Some(self.infer_c_type(e, var_types)),
+                }).unwrap_or_default();
+                if arg_ty == "double" {
+                    format!("kernel_fabs({})", a)
+                } else {
+                    format!("kernel_abs({})", a)
+                }
             }
             "raw_write" => {
                 let addr = args.get(0).map(|a| self.call_arg(a, is_ptr, var_types)).unwrap_or_default();
@@ -410,6 +440,7 @@ impl Codegen {
             let helper = match ty.as_str() {
                 "const char*" => "kernel_print_str",
                 "bool" => "kernel_print_bool",
+                "double" => "kernel_print_float",
                 _ => "kernel_print_long",
             };
             out.push_str(&format!("{}{}({});\n", pad, helper, self.expr(e, is_ptr, var_types)));

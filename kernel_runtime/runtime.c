@@ -107,6 +107,33 @@ long kernel_abs(long x) {
     return x < 0 ? -x : x;
 }
 
+double kernel_fabs(double x) {
+    return x < 0 ? -x : x;
+}
+
+/* Prints a double with exactly 2 decimal places, matching Rust's "{:.2}"
+ * format exactly (that's the interpreter's float Display impl — see
+ * interpreter.rs) so both execution paths produce identical output with
+ * no printf/libm available in this freestanding environment. */
+void kernel_print_float(double x) {
+    if (x < 0) {
+        kernel_print_char('-');
+        x = -x;
+    }
+    /* round to 2 decimal places by scaling, matching standard "round half
+     * up" behavior for the common case */
+    long scaled = (long)(x * 100.0 + 0.5);
+    long int_part = scaled / 100;
+    long frac_part = scaled % 100;
+
+    kernel_print_long(int_part);
+    kernel_print_char('.');
+    if (frac_part < 10) {
+        kernel_print_char('0');
+    }
+    kernel_print_long(frac_part);
+}
+
 /* String concatenation, freestanding-safe: no malloc/heap in this
  * bare-metal environment, so concatenation writes into a small rotating
  * pool of static buffers instead of allocating. This bounds both the

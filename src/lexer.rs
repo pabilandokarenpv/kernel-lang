@@ -8,6 +8,7 @@ pub enum Token {
     // literals / identifiers
     Ident(String),
     Int(i64),
+    Float(f64),
     Str(String),
 
     // keywords
@@ -232,6 +233,23 @@ impl Lexer {
                 } else {
                     break;
                 }
+            }
+            // a '.' followed by a digit makes this a float literal; a '.'
+            // followed by another '.' is the range operator (`1..5`) and
+            // must be left alone so next_token's two-char-operator check
+            // still sees it.
+            if self.peek() == Some('.') && self.peek_at(1).map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                s.push('.');
+                self.advance();
+                while let Some(c) = self.peek() {
+                    if c.is_ascii_digit() {
+                        s.push(c);
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                return Some(Token::Float(s.parse().unwrap_or(0.0)));
             }
             return Some(Token::Int(s.parse().unwrap_or(0)));
         }

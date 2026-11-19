@@ -63,6 +63,7 @@ pub enum AssignOp {
 #[derive(Debug, Clone)]
 pub enum Expr {
     Int(i64),
+    Float(f64),
     Str(String),
     Bool(bool),
     Ident(String),

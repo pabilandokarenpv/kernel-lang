@@ -444,6 +444,7 @@ impl Parser {
     fn parse_primary(&mut self) -> Expr {
         match self.advance() {
             Token::Int(n) => Expr::Int(n),
+            Token::Float(f) => Expr::Float(f),
             Token::Str(s) => Expr::Str(s),
             Token::True => Expr::Bool(true),
             Token::False => Expr::Bool(false),

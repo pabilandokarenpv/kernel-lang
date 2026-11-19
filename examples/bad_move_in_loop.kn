@@ -1,0 +1,14 @@
+struct Point:
+    x: int
+    y: int
+
+fn take(p: Point):
+    print(p.x)
+
+fn main():
+    let origin = Point(x: 1, y: 2)
+    let mut i = 0
+    while i < 1:
+        take(origin)       # moved inside the loop body
+        i += 1
+    take(origin)            # ERROR: use of possibly-moved value

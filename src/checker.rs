@@ -11,11 +11,13 @@
 //      `unsafe fn` body is a hard error.
 //
 // NOT implemented in v1 (documented limitation, not a silent gap):
-//   - cross-branch move merging (if/elif/else, while, for bodies are checked
-//     each in their own scope snapshot; a move inside a branch does not
-//     propagate to the parent scope after the block exits). This can miss
-//     real use-after-move bugs that only occur on certain branches. Real
-//     Rust-style control-flow-merged move analysis is a v1.x refinement.
+//   - re-move-on-next-iteration detection inside a single loop (a value
+//     moved on one pass through a `while`/`for` body being reused on the
+//     next pass of the SAME loop) — cross-statement merging across
+//     if/elif/else and in/out of while/for bodies IS implemented (moving
+//     a value inside just one branch, or inside a loop body, is now
+//     correctly visible to code after that branch/loop), the gap is
+//     specifically the next trip through one loop's own body.
 //   - simultaneous mutable/immutable borrow conflicts (the hard 20% of a
 //     real borrow checker). v1 only tracks move-vs-borrow at the call site.
 
@@ -113,26 +115,63 @@ impl Checker {
                 self.check_expr(value, scope, unsafe_ctx, fn_name);
             }
             Stmt::If { arms, else_body } => {
+                let mut branch_outputs: Vec<HashMap<String, VarState>> = Vec::new();
                 for (cond, body) in arms {
                     self.check_expr(cond, scope, unsafe_ctx, fn_name);
                     let mut branch_scope = scope.clone();
                     self.check_block(body, &mut branch_scope, unsafe_ctx, fn_name);
+                    branch_outputs.push(branch_scope);
                 }
                 if let Some(body) = else_body {
                     let mut branch_scope = scope.clone();
                     self.check_block(body, &mut branch_scope, unsafe_ctx, fn_name);
+                    branch_outputs.push(branch_scope);
+                }
+                // Merge branch outcomes back into the parent scope: a
+                // variable that existed before the `if` is treated as
+                // moved afterward if it was moved on ANY reachable branch
+                // — we don't statically know which branch ran, so "might
+                // have been moved" is conservatively treated as "is
+                // moved." This holds even without an `else`, since the
+                // implicit skip-path never moves anything but an explicit
+                // arm might have. This is the control-flow merge
+                // previously missing (see ARD-003) — without it, a move
+                // inside just one `if` arm was invisible to every
+                // statement after the `if`.
+                for (name, state) in scope.iter_mut() {
+                    if branch_outputs.iter().any(|b| b.get(name).map(|s| s.moved).unwrap_or(false)) {
+                        state.moved = true;
+                    }
                 }
             }
             Stmt::While { cond, body } => {
                 self.check_expr(cond, scope, unsafe_ctx, fn_name);
+                // Loops run zero or more times, so a move inside the body
+                // must propagate back into the parent scope after the loop
+                // (it might have happened). NOT yet caught: a move on one
+                // iteration being re-used on the next iteration of the
+                // SAME loop (would need the body checked twice — once to
+                // discover what gets moved, once more against that
+                // already-moved state) — documented as a further gap
+                // beyond this fix, not silently assumed solved.
                 let mut branch_scope = scope.clone();
                 self.check_block(body, &mut branch_scope, unsafe_ctx, fn_name);
+                for (name, state) in scope.iter_mut() {
+                    if branch_scope.get(name).map(|s| s.moved).unwrap_or(false) {
+                        state.moved = true;
+                    }
+                }
             }
             Stmt::For { var, iter, body } => {
                 self.check_expr(iter, scope, unsafe_ctx, fn_name);
                 let mut branch_scope = scope.clone();
                 branch_scope.insert(var.clone(), VarState { copy: true, moved: false });
                 self.check_block(body, &mut branch_scope, unsafe_ctx, fn_name);
+                for (name, state) in scope.iter_mut() {
+                    if branch_scope.get(name).map(|s| s.moved).unwrap_or(false) {
+                        state.moved = true;
+                    }
+                }
             }
             Stmt::Return(expr) => {
                 if let Some(e) = expr {

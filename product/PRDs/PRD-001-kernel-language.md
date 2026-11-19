@@ -61,18 +61,27 @@ Two distinct problems, solved by one project:
 
 ## Roadmap (not yet built — dated plan)
 
+> **See [PRD-002](./PRD-002-universal-language-vision.md) for the expanded
+> v2+ vision** (researched competitive pain points vs. Python/Rust/Go/
+> React/Next.js/Tailwind, and new v6-v9 stages for ML, quantum computing,
+> embedded/Arduino, and blockchain) and
+> [ARD-005](../../architecture/ARDs/ARD-005-universal-backend-philosophy.md)
+> for why this breadth doesn't fragment the language into per-domain forks.
+
 ```mermaid
 flowchart LR
     V1["v1: systems/kernel\nC backend\nboots in QEMU + feeds Kernel-LLM corpus"] --> V2["v2: native perf + backend/server\nLLVM backend (inkwell)\ngoroutine-style concurrency, net/json/db stdlib, package manager"]
     V2 --> V3["v3: web\nWASM backend\nbrowser + PWA"]
     V3 --> V4["v4: mobile\nnative FFI or WASM+WebView\niOS/Android"]
     V4 --> V5["v5: full-stack apps\nKernel UI: React-style component lib\nwritten IN Kernel, on v3/v4 backends"]
+    V5 -.->|"see PRD-002"| V6["v6-v9: ML, quantum,\nembedded, blockchain"]
 
     style V1 fill:#16213e,stroke:#0f3460,color:#fff
     style V2 fill:#2d2d44,stroke:#555,color:#aaa
     style V3 fill:#2d2d44,stroke:#555,color:#aaa
     style V4 fill:#2d2d44,stroke:#555,color:#aaa
     style V5 fill:#2d2d44,stroke:#555,color:#aaa
+    style V6 fill:#1a1a2e,stroke:#555,color:#888,stroke-dasharray: 5 5
 ```
 
 Each stage plugs a new backend into the same frontend — not a rewrite.

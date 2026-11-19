@@ -9,3 +9,4 @@ it, the alternatives considered, and the consequences we accepted.
 | [ARD-002](./ARD-002-compilation-pipeline-shape.md) | Pipeline shape: AST → C, no separate Kernel IR | Accepted |
 | [ARD-003](./ARD-003-ownership-checker-scope.md) | Ownership checker: move-checking without control-flow merge | Accepted |
 | [ARD-004](./ARD-004-rust-as-implementation-language.md) | Compiler implementation language: Rust | Accepted |
+| [ARD-005](./ARD-005-universal-backend-philosophy.md) | Universal backend philosophy: one checked AST, many pluggable targets, no per-domain forks | Accepted |

@@ -197,10 +197,26 @@ impl Parser {
         let mut params = Vec::new();
         while !self.check(&Token::RParen) {
             let mutable = self.eat(&Token::Mut);
-            let borrowed = self.eat(&Token::Amp);
             let pname = self.ident();
             self.expect(Token::Colon);
-            let ty = self.parse_type();
+            // Kernel's actual reference syntax puts `&` on the TYPE side
+            // (`p: &Point`, matching every example and the README), not
+            // before the parameter name. parse_type() already folds a
+            // leading `&` into the returned type string (e.g. "&Point") —
+            // detect and strip it here so `ty` is always the bare struct
+            // name everywhere downstream (checker's struct-name lookup,
+            // codegen's c_type()), with `borrowed` as the single source of
+            // truth for "this is a reference," instead of leaving the `&`
+            // baked into a string two different ways in two different
+            // places (found as a real bug: the checker's `.structs.contains(&p.ty)`
+            // lookup silently failed for "&Point" since only "Point" is
+            // registered, and codegen's fn_signature always emitted the
+            // struct by value since `borrowed` here was dead/always-false).
+            let raw_ty = self.parse_type();
+            let (borrowed, ty) = match raw_ty.strip_prefix('&') {
+                Some(rest) => (true, rest.to_string()),
+                None => (false, raw_ty),
+            };
             params.push(Param { name: pname, ty, borrowed, mutable });
             if !self.eat(&Token::Comma) {
                 break;

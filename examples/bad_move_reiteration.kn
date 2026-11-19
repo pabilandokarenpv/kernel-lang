@@ -1,0 +1,13 @@
+struct Point:
+    x: int
+    y: int
+
+fn take(p: Point):
+    print(p.x)
+
+fn main():
+    let origin = Point(x: 1, y: 2)
+    let mut i = 0
+    while i < 3:
+        take(origin)       # ERROR: moved on iteration 1, re-used on iteration 2
+        i += 1

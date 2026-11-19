@@ -6,18 +6,17 @@
 //      canonical `take(origin)` / `peek(&origin)` example from the README.
 //      A bare `name` passed as a call argument MOVES it; `&name` BORROWS it
 //      (no state change). Using a moved variable again is a hard error.
+//      Control-flow is fully merged: a move inside just one `if`/`elif`/
+//      `else` arm, inside a `while`/`for` body, or reused on the NEXT pass
+//      through that same loop body, is all correctly caught (each is
+//      checked against its own scope clone, then merged back; loops are
+//      additionally checked twice — once normally, once more seeded with
+//      the first pass's end state — to catch re-move-on-next-iteration).
 //   2. Unsafe enforcement: calling a known-unsafe operation (the `raw_write`
 //      builtin, or any `unsafe fn`) outside an `unsafe:` block or an
 //      `unsafe fn` body is a hard error.
 //
 // NOT implemented in v1 (documented limitation, not a silent gap):
-//   - re-move-on-next-iteration detection inside a single loop (a value
-//     moved on one pass through a `while`/`for` body being reused on the
-//     next pass of the SAME loop) — cross-statement merging across
-//     if/elif/else and in/out of while/for bodies IS implemented (moving
-//     a value inside just one branch, or inside a loop body, is now
-//     correctly visible to code after that branch/loop), the gap is
-//     specifically the next trip through one loop's own body.
 //   - simultaneous mutable/immutable borrow conflicts (the hard 20% of a
 //     real borrow checker). v1 only tracks move-vs-borrow at the call site.
 
@@ -146,16 +145,35 @@ impl Checker {
             }
             Stmt::While { cond, body } => {
                 self.check_expr(cond, scope, unsafe_ctx, fn_name);
-                // Loops run zero or more times, so a move inside the body
-                // must propagate back into the parent scope after the loop
-                // (it might have happened). NOT yet caught: a move on one
-                // iteration being re-used on the next iteration of the
-                // SAME loop (would need the body checked twice — once to
-                // discover what gets moved, once more against that
-                // already-moved state) — documented as a further gap
-                // beyond this fix, not silently assumed solved.
+                // Pass 1: check the body once, starting from the scope on
+                // entry — this is "iteration 1," and is also how a single
+                // pass through the loop gets checked normally.
                 let mut branch_scope = scope.clone();
                 self.check_block(body, &mut branch_scope, unsafe_ctx, fn_name);
+
+                // Pass 2: re-check the SAME body starting from iteration
+                // 1's end state, simulating "iteration 2" — a loop can run
+                // more than once, so anything moved during one pass must be
+                // treated as already-moved on the next pass through the
+                // same body. Any error that appears ONLY in this second
+                // pass (not already reported in pass 1) is exactly a
+                // re-move-on-next-iteration bug; errors that appear in both
+                // passes are the same root cause already reported once, not
+                // duplicated.
+                let pass1_len = self.errors.len();
+                let first_pass_errors: HashSet<String> = self.errors[..pass1_len].iter().cloned().collect();
+                let mut branch_scope2 = branch_scope.clone();
+                self.check_block(body, &mut branch_scope2, unsafe_ctx, fn_name);
+                let new_errors = self.errors.split_off(pass1_len);
+                for e in new_errors {
+                    if !first_pass_errors.contains(&e) {
+                        self.errors.push(format!(
+                            "{} (only on the loop's next iteration — this value was moved on an earlier pass through the same loop body)",
+                            e
+                        ));
+                    }
+                }
+
                 for (name, state) in scope.iter_mut() {
                     if branch_scope.get(name).map(|s| s.moved).unwrap_or(false) {
                         state.moved = true;
@@ -167,6 +185,22 @@ impl Checker {
                 let mut branch_scope = scope.clone();
                 branch_scope.insert(var.clone(), VarState { copy: true, moved: false });
                 self.check_block(body, &mut branch_scope, unsafe_ctx, fn_name);
+
+                // Same two-pass re-iteration check as While (see above).
+                let pass1_len = self.errors.len();
+                let first_pass_errors: HashSet<String> = self.errors[..pass1_len].iter().cloned().collect();
+                let mut branch_scope2 = branch_scope.clone();
+                self.check_block(body, &mut branch_scope2, unsafe_ctx, fn_name);
+                let new_errors = self.errors.split_off(pass1_len);
+                for e in new_errors {
+                    if !first_pass_errors.contains(&e) {
+                        self.errors.push(format!(
+                            "{} (only on the loop's next iteration — this value was moved on an earlier pass through the same loop body)",
+                            e
+                        ));
+                    }
+                }
+
                 for (name, state) in scope.iter_mut() {
                     if branch_scope.get(name).map(|s| s.moved).unwrap_or(false) {
                         state.moved = true;

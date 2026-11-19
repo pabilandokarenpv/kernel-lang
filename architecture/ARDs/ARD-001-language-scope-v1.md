@@ -22,11 +22,14 @@ generator itself a bigger project than the language.
 ## Decision
 
 v1 ships with exactly: functions, structs, `if/elif/else`, `while`,
-`for v in lo..hi`, `unsafe` blocks, and `int` as the only primitive type.
-No strings, floats, generics, traits, enums, pattern matching, or closures
-in the interpreter or codegen for v1 — even though some of this syntax is
-already *specified* in the grammar (for corpus-generator variety down the
-line), it is not implemented in the checker/interpreter/codegen.
+`for v in lo..hi`, `unsafe` blocks, `int` and `str` as primitive types
+(string concatenation via `+`/`+=` verified working identically in both
+the interpreter and the compiled-to-QEMU path — see
+`examples/string_concat.kn`). No floats, generics, traits, enums, pattern
+matching, or closures in the interpreter or codegen for v1 — even though
+some of this syntax is already *specified* in the grammar (for
+corpus-generator variety down the line), it is not implemented in the
+checker/interpreter/codegen.
 
 ## Alternatives considered
 

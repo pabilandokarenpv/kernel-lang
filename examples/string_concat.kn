@@ -1,0 +1,10 @@
+fn main():
+    let name = "World"
+    let greeting = "Hello, "
+    print(greeting + name)
+    print("direct string literal")
+
+    let mut msg = "Count: "
+    msg += "five"
+    print(msg)
+    print("literal" + " " + "concat")

@@ -106,3 +106,31 @@ void kernel_print_newline(void) {
 long kernel_abs(long x) {
     return x < 0 ? -x : x;
 }
+
+/* String concatenation, freestanding-safe: no malloc/heap in this
+ * bare-metal environment, so concatenation writes into a small rotating
+ * pool of static buffers instead of allocating. This bounds both the
+ * result length (KERNEL_STRCAT_BUF_LEN) and the number of concatenation
+ * results that can be "alive" at once (KERNEL_STRCAT_NUM_BUFS) before an
+ * older result gets overwritten — a documented v1 limitation, not a
+ * silent one, matching how the rest of this freestanding runtime works. */
+#define KERNEL_STRCAT_BUF_LEN 256
+#define KERNEL_STRCAT_NUM_BUFS 8
+
+static char kernel_strcat_bufs[KERNEL_STRCAT_NUM_BUFS][KERNEL_STRCAT_BUF_LEN];
+static int kernel_strcat_next_buf = 0;
+
+const char *kernel_strcat(const char *a, const char *b) {
+    char *buf = kernel_strcat_bufs[kernel_strcat_next_buf];
+    kernel_strcat_next_buf = (kernel_strcat_next_buf + 1) % KERNEL_STRCAT_NUM_BUFS;
+
+    int i = 0;
+    while (*a && i < KERNEL_STRCAT_BUF_LEN - 1) {
+        buf[i++] = *a++;
+    }
+    while (*b && i < KERNEL_STRCAT_BUF_LEN - 1) {
+        buf[i++] = *b++;
+    }
+    buf[i] = '\0';
+    return buf;
+}

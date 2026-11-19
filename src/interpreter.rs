@@ -146,7 +146,7 @@ impl Interpreter {
                     AssignOp::Add => {
                         let cur = self.get_var(name);
                         let rhs = self.eval(value);
-                        binop_int(&cur, &rhs, |a, b| a + b)
+                        eval_binop(&cur, BinOp::Add, &rhs)
                     }
                     AssignOp::Sub => {
                         let cur = self.get_var(name);

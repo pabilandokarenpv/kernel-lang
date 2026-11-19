@@ -9,6 +9,13 @@
 // structs, if/elif/else, while, for-in-range, the `unsafe` block, and the
 // `print`/`abs`/`raw_write` builtins. `print` is special-cased at the
 // statement level since C has no variadic-by-type dispatch.
+//
+// Type inference is a flat per-function variable-type map (`var_types`)
+// threaded through statement/expression generation, not full lexical
+// scoping — sufficient for v1's subset (see ARD-003 in
+// architecture/ARDs/: the checker itself doesn't do control-flow-merged
+// scoping yet either, so this matches the project's existing rigor level,
+// not a new corner cut specifically for this fix).
 
 use crate::ast::*;
 use std::collections::{HashMap, HashSet};
@@ -46,14 +53,31 @@ impl Codegen {
         }
     }
 
-    fn infer_c_type(&self, expr: &Expr) -> String {
+    /// Infers an expression's C type. `var_types` resolves identifiers to
+    /// the type recorded when they were declared (by `Stmt::Let` or a
+    /// function parameter) — without this, `Expr::Ident` type inference
+    /// would have no way to know a variable holds a string vs an int,
+    /// which is exactly the bug this map exists to fix (string
+    /// concatenation via `+` silently mis-typed as `long` until a real
+    /// variable-type environment was threaded through codegen).
+    fn infer_c_type(&self, expr: &Expr, var_types: &HashMap<String, String>) -> String {
         match expr {
             Expr::Int(_) => "long".to_string(),
             Expr::Str(_) => "const char*".to_string(),
             Expr::Bool(_) => "bool".to_string(),
+            Expr::Binary(l, BinOp::Add, r) => {
+                let lt = self.infer_c_type(l, var_types);
+                let rt = self.infer_c_type(r, var_types);
+                if lt == "const char*" && rt == "const char*" {
+                    "const char*".to_string()
+                } else {
+                    "long".to_string()
+                }
+            }
             Expr::Binary(..) | Expr::Unary(..) => "long".to_string(),
             Expr::Field(..) => "long".to_string(), // v1: only primitive fields are read this way
-            Expr::Ident(_) | Expr::Borrow(_) | Expr::Range(..) => "long".to_string(),
+            Expr::Ident(name) => var_types.get(name).cloned().unwrap_or_else(|| "long".to_string()),
+            Expr::Borrow(_) | Expr::Range(..) => "long".to_string(),
             Expr::Call { name, .. } => {
                 if self.structs.contains(name) {
                     format!("struct {}", name)
@@ -79,7 +103,8 @@ impl Codegen {
         out.push_str("void kernel_print_bool(bool b);\n");
         out.push_str("void kernel_print_space(void);\n");
         out.push_str("void kernel_print_newline(void);\n");
-        out.push_str("long kernel_abs(long x);\n\n");
+        out.push_str("long kernel_abs(long x);\n");
+        out.push_str("const char *kernel_strcat(const char *a, const char *b);\n\n");
 
         // struct definitions
         for item in &program.items {
@@ -96,10 +121,20 @@ impl Codegen {
         for item in &program.items {
             match item {
                 Item::Static { name, ty, value, .. } => {
-                    out.push_str(&format!("static {} {} = {};\n", self.c_type(ty), name, self.expr(value, &HashMap::new())));
+                    out.push_str(&format!(
+                        "static {} {} = {};\n",
+                        self.c_type(ty),
+                        name,
+                        self.expr(value, &HashMap::new(), &HashMap::new())
+                    ));
                 }
                 Item::Const { name, ty, value } => {
-                    out.push_str(&format!("static const {} {} = {};\n", self.c_type(ty), name, self.expr(value, &HashMap::new())));
+                    out.push_str(&format!(
+                        "static const {} {} = {};\n",
+                        self.c_type(ty),
+                        name,
+                        self.expr(value, &HashMap::new(), &HashMap::new())
+                    ));
                 }
                 _ => {}
             }
@@ -122,8 +157,13 @@ impl Codegen {
                 out.push_str(&self.fn_signature(f));
                 out.push_str(" {\n");
                 let is_ptr = self.param_pointer_map(f);
+                let mut var_types: HashMap<String, String> = f
+                    .params
+                    .iter()
+                    .map(|p| (p.name.clone(), self.c_type(&p.ty)))
+                    .collect();
                 for stmt in &f.body {
-                    out.push_str(&self.stmt(stmt, &is_ptr, 1));
+                    out.push_str(&self.stmt(stmt, &is_ptr, 1, &mut var_types));
                 }
                 out.push_str("}\n\n");
             }
@@ -175,61 +215,73 @@ impl Codegen {
         }
     }
 
-    fn expr(&self, e: &Expr, is_ptr: &HashMap<String, bool>) -> String {
+    fn expr(&self, e: &Expr, is_ptr: &HashMap<String, bool>, var_types: &HashMap<String, String>) -> String {
         match e {
             Expr::Int(n) => n.to_string(),
             Expr::Str(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
             Expr::Bool(b) => (if *b { "true" } else { "false" }).to_string(),
             Expr::Ident(name) => name.clone(),
             Expr::Range(..) => panic!("Kernel codegen: range only valid as a for-loop iterator"),
-            Expr::Unary(UnaryOp::Neg, inner) => format!("(-{})", self.expr(inner, is_ptr)),
-            Expr::Unary(UnaryOp::Not, inner) => format!("(!{})", self.expr(inner, is_ptr)),
-            Expr::Binary(l, op, r) => format!(
-                "({} {} {})",
-                self.expr(l, is_ptr),
-                self.binop(*op),
-                self.expr(r, is_ptr)
-            ),
-            Expr::Field(obj, field) => {
-                format!("{}{}{}", self.expr(obj, is_ptr), self.accessor(obj, is_ptr), field)
+            Expr::Unary(UnaryOp::Neg, inner) => format!("(-{})", self.expr(inner, is_ptr, var_types)),
+            Expr::Unary(UnaryOp::Not, inner) => format!("(!{})", self.expr(inner, is_ptr, var_types)),
+            Expr::Binary(l, op, r) => {
+                if *op == BinOp::Add
+                    && self.infer_c_type(l, var_types) == "const char*"
+                    && self.infer_c_type(r, var_types) == "const char*"
+                {
+                    return format!(
+                        "kernel_strcat({}, {})",
+                        self.expr(l, is_ptr, var_types),
+                        self.expr(r, is_ptr, var_types)
+                    );
+                }
+                format!(
+                    "({} {} {})",
+                    self.expr(l, is_ptr, var_types),
+                    self.binop(*op),
+                    self.expr(r, is_ptr, var_types)
+                )
             }
-            Expr::Borrow(inner) => format!("(&{})", self.expr(inner, is_ptr)),
-            Expr::Call { name, args } => self.call_expr(name, args, is_ptr),
+            Expr::Field(obj, field) => {
+                format!("{}{}{}", self.expr(obj, is_ptr, var_types), self.accessor(obj, is_ptr), field)
+            }
+            Expr::Borrow(inner) => format!("(&{})", self.expr(inner, is_ptr, var_types)),
+            Expr::Call { name, args } => self.call_expr(name, args, is_ptr, var_types),
         }
     }
 
-    fn call_expr(&self, name: &str, args: &[CallArg], is_ptr: &HashMap<String, bool>) -> String {
+    fn call_expr(&self, name: &str, args: &[CallArg], is_ptr: &HashMap<String, bool>, var_types: &HashMap<String, String>) -> String {
         match name {
             "abs" => {
-                let a = args.first().map(|a| self.call_arg(a, is_ptr)).unwrap_or_default();
+                let a = args.first().map(|a| self.call_arg(a, is_ptr, var_types)).unwrap_or_default();
                 format!("kernel_abs({})", a)
             }
             "raw_write" => {
-                let addr = args.get(0).map(|a| self.call_arg(a, is_ptr)).unwrap_or_default();
-                let byte = args.get(1).map(|a| self.call_arg(a, is_ptr)).unwrap_or_default();
+                let addr = args.get(0).map(|a| self.call_arg(a, is_ptr, var_types)).unwrap_or_default();
+                let byte = args.get(1).map(|a| self.call_arg(a, is_ptr, var_types)).unwrap_or_default();
                 format!("(*(volatile unsigned char*)({}) = (unsigned char)({}))", addr, byte)
             }
             _ if self.structs.contains(name) => {
                 let fields: Vec<String> = args
                     .iter()
                     .filter_map(|a| match a {
-                        CallArg::Named(fname, e) => Some(format!(".{} = {}", fname, self.expr(e, is_ptr))),
+                        CallArg::Named(fname, e) => Some(format!(".{} = {}", fname, self.expr(e, is_ptr, var_types))),
                         CallArg::Positional(_) => None,
                     })
                     .collect();
                 format!("(struct {}){{{}}}", name, fields.join(", "))
             }
             _ => {
-                let joined: Vec<String> = args.iter().map(|a| self.call_arg(a, is_ptr)).collect();
+                let joined: Vec<String> = args.iter().map(|a| self.call_arg(a, is_ptr, var_types)).collect();
                 format!("{}({})", name, joined.join(", "))
             }
         }
     }
 
-    fn call_arg(&self, a: &CallArg, is_ptr: &HashMap<String, bool>) -> String {
+    fn call_arg(&self, a: &CallArg, is_ptr: &HashMap<String, bool>, var_types: &HashMap<String, String>) -> String {
         match a {
-            CallArg::Positional(e) => self.expr(e, is_ptr),
-            CallArg::Named(_, e) => self.expr(e, is_ptr),
+            CallArg::Positional(e) => self.expr(e, is_ptr, var_types),
+            CallArg::Named(_, e) => self.expr(e, is_ptr, var_types),
         }
     }
 
@@ -237,12 +289,14 @@ impl Codegen {
         "    ".repeat(n)
     }
 
-    fn stmt(&self, s: &Stmt, is_ptr: &HashMap<String, bool>, depth: usize) -> String {
+    fn stmt(&self, s: &Stmt, is_ptr: &HashMap<String, bool>, depth: usize, var_types: &mut HashMap<String, String>) -> String {
         let pad = Self::indent(depth);
         match s {
             Stmt::Let { name, value, .. } => {
-                let ty = self.infer_c_type(value);
-                format!("{}{} {} = {};\n", pad, ty, name, self.expr(value, is_ptr))
+                let ty = self.infer_c_type(value, var_types);
+                let rendered = format!("{}{} {} = {};\n", pad, ty, name, self.expr(value, is_ptr, var_types));
+                var_types.insert(name.clone(), ty);
+                rendered
             }
             Stmt::Assign { name, op, value } => {
                 let op_str = match op {
@@ -250,68 +304,82 @@ impl Codegen {
                     AssignOp::Add => "+=",
                     AssignOp::Sub => "-=",
                 };
-                format!("{}{} {} {};\n", pad, name, op_str, self.expr(value, is_ptr))
+                if *op == AssignOp::Add && var_types.get(name).map(|t| t.as_str()) == Some("const char*") {
+                    // string += string has the same "no native C operator"
+                    // problem as string + string — route through the same
+                    // runtime helper instead of emitting invalid C.
+                    return format!(
+                        "{}{} = kernel_strcat({}, {});\n",
+                        pad, name, name, self.expr(value, is_ptr, var_types)
+                    );
+                }
+                format!("{}{} {} {};\n", pad, name, op_str, self.expr(value, is_ptr, var_types))
             }
             Stmt::FieldAssign { object, field, value } => {
                 format!(
                     "{}{}{}{} = {};\n",
                     pad,
-                    self.expr(object, is_ptr),
+                    self.expr(object, is_ptr, var_types),
                     self.accessor(object, is_ptr),
                     field,
-                    self.expr(value, is_ptr)
+                    self.expr(value, is_ptr, var_types)
                 )
             }
             Stmt::If { arms, else_body } => {
                 let mut out = String::new();
                 for (i, (cond, body)) in arms.iter().enumerate() {
                     let kw = if i == 0 { "if" } else { "else if" };
-                    out.push_str(&format!("{}{} ({}) {{\n", pad, kw, self.expr(cond, is_ptr)));
+                    out.push_str(&format!("{}{} ({}) {{\n", pad, kw, self.expr(cond, is_ptr, var_types)));
+                    let mut branch_types = var_types.clone();
                     for st in body {
-                        out.push_str(&self.stmt(st, is_ptr, depth + 1));
+                        out.push_str(&self.stmt(st, is_ptr, depth + 1, &mut branch_types));
                     }
                     out.push_str(&format!("{}}}\n", pad));
                 }
                 if let Some(body) = else_body {
                     out.push_str(&format!("{}else {{\n", pad));
+                    let mut branch_types = var_types.clone();
                     for st in body {
-                        out.push_str(&self.stmt(st, is_ptr, depth + 1));
+                        out.push_str(&self.stmt(st, is_ptr, depth + 1, &mut branch_types));
                     }
                     out.push_str(&format!("{}}}\n", pad));
                 }
                 out
             }
             Stmt::While { cond, body } => {
-                let mut out = format!("{}while ({}) {{\n", pad, self.expr(cond, is_ptr));
+                let mut out = format!("{}while ({}) {{\n", pad, self.expr(cond, is_ptr, var_types));
+                let mut branch_types = var_types.clone();
                 for st in body {
-                    out.push_str(&self.stmt(st, is_ptr, depth + 1));
+                    out.push_str(&self.stmt(st, is_ptr, depth + 1, &mut branch_types));
                 }
                 out.push_str(&format!("{}}}\n", pad));
                 out
             }
             Stmt::For { var, iter, body } => {
                 let (lo, hi) = match iter {
-                    Expr::Range(lo, hi) => (self.expr(lo, is_ptr), self.expr(hi, is_ptr)),
+                    Expr::Range(lo, hi) => (self.expr(lo, is_ptr, var_types), self.expr(hi, is_ptr, var_types)),
                     _ => panic!("Kernel codegen: for-loop requires a range (a..b)"),
                 };
                 let mut out = format!(
                     "{}for (long {} = {}; {} < {}; {}++) {{\n",
                     pad, var, lo, var, hi, var
                 );
+                let mut branch_types = var_types.clone();
+                branch_types.insert(var.clone(), "long".to_string());
                 for st in body {
-                    out.push_str(&self.stmt(st, is_ptr, depth + 1));
+                    out.push_str(&self.stmt(st, is_ptr, depth + 1, &mut branch_types));
                 }
                 out.push_str(&format!("{}}}\n", pad));
                 out
             }
             Stmt::Return(expr) => match expr {
-                Some(e) => format!("{}return {};\n", pad, self.expr(e, is_ptr)),
+                Some(e) => format!("{}return {};\n", pad, self.expr(e, is_ptr, var_types)),
                 None => format!("{}return;\n", pad),
             },
             Stmt::Unsafe(body) => {
                 let mut out = format!("{}{{\n", pad);
                 for st in body {
-                    out.push_str(&self.stmt(st, is_ptr, depth + 1));
+                    out.push_str(&self.stmt(st, is_ptr, depth + 1, var_types));
                 }
                 out.push_str(&format!("{}}}\n", pad));
                 out
@@ -319,15 +387,15 @@ impl Codegen {
             Stmt::Expr(e) => {
                 if let Expr::Call { name, args } = e {
                     if name == "print" {
-                        return self.print_stmt(args, is_ptr, depth);
+                        return self.print_stmt(args, is_ptr, depth, var_types);
                     }
                 }
-                format!("{}{};\n", pad, self.expr(e, is_ptr))
+                format!("{}{};\n", pad, self.expr(e, is_ptr, var_types))
             }
         }
     }
 
-    fn print_stmt(&self, args: &[CallArg], is_ptr: &HashMap<String, bool>, depth: usize) -> String {
+    fn print_stmt(&self, args: &[CallArg], is_ptr: &HashMap<String, bool>, depth: usize, var_types: &HashMap<String, String>) -> String {
         let pad = Self::indent(depth);
         let mut out = String::new();
         for (i, a) in args.iter().enumerate() {
@@ -338,13 +406,13 @@ impl Codegen {
                 CallArg::Positional(e) => e,
                 CallArg::Named(_, e) => e,
             };
-            let ty = self.infer_c_type(e);
+            let ty = self.infer_c_type(e, var_types);
             let helper = match ty.as_str() {
                 "const char*" => "kernel_print_str",
                 "bool" => "kernel_print_bool",
                 _ => "kernel_print_long",
             };
-            out.push_str(&format!("{}{}({});\n", pad, helper, self.expr(e, is_ptr)));
+            out.push_str(&format!("{}{}({});\n", pad, helper, self.expr(e, is_ptr, var_types)));
         }
         out.push_str(&format!("{}kernel_print_newline();\n", pad));
         out

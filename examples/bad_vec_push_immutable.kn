@@ -1,0 +1,4 @@
+fn main():
+    let v: Vec<int> = vec_new()
+    vec_push(&v, 1)
+    print(vec_len(v))

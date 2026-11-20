@@ -1,0 +1,10 @@
+static mut COUNTER: int = 0
+
+fn bump() -> int:
+    COUNTER += 1
+    return COUNTER
+
+fn main():
+    print(bump())
+    print(bump())
+    print(bump())

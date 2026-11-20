@@ -53,6 +53,40 @@ flowchart LR
   ports, raw pointers) — explicit and visually marked, never silently
   available outside the block. See `examples/bad_unsafe_outside_block.kn`
   for the verified-rejected case.
+- **Immutability by default is enforced, not just parsed.** `let x = 5`
+  (no `mut`) followed by `x = 10`, `x.field = 10`, `arr[0] = 10`, or
+  `vec_push(&mut x, ...)` is a real checker error naming the exact
+  variable — a real, previously-real gap closed in a later audit pass:
+  `Stmt::Let`'s `mutable` AST field had existed since the statement was
+  first written, but nothing ever actually READ it (confirmed by a real
+  `cargo build` dead-code warning: "field `mutable` is never read" —
+  the compiler was quite literally telling us this the whole time).
+  Covers module-level `static`/`const` globals too (a `static` without
+  `mut`, or any `const`, can never be reassigned) via a parallel
+  `global_mutable` map. See `examples/bad_assign_immutable.kn`,
+  `bad_assign_immutable_static.kn`, `bad_assign_const.kn`,
+  `bad_field_assign_immutable.kn`, `bad_index_assign_immutable.kn`, and
+  `bad_vec_push_immutable.kn` for the verified-rejected cases.
+- **A real, now-fixed cross-backend disagreement**, found during the same
+  audit: `interpreter.rs`'s `set_var` never actually wrote through to
+  `self.globals` -- it silently created a brand-new LOCAL shadow binding
+  instead, so a `static mut COUNTER` mutated inside a function (e.g.
+  `COUNTER += 1`) never actually persisted back to the real global. Each
+  separate call to that function started fresh from the global's
+  ORIGINAL value. Concretely: calling the same `bump()` three times in a
+  row printed `1, 1, 1` on `kernel run` while `kernel build` and `kernel
+  build-native` both correctly printed `1, 2, 3` (both resolve a
+  `static` identifier to one real, persistent memory location at
+  compile time, so neither ever had this bug) — exactly the kind of
+  silent interpreter/compiled-backend divergence this project's
+  regression discipline exists to catch, caught here by deliberately
+  auditing for it rather than by accident. Fixed by having `set_var`
+  fall back to a real `self.globals` write when `name` isn't any
+  currently-live local, before ever falling back to "new local
+  binding" (verified every current call site of `set_var` only ever
+  targets a name that's already either a local or a global -- `let` is
+  the only thing that introduces a genuinely NEW binding, and it never
+  goes through `set_var` at all). See `examples/global_persist_test.kn`.
 
 ## Types (v1)
 

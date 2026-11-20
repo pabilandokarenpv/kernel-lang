@@ -163,7 +163,6 @@ impl Codegen {
             Expr::Binary(..) => "long".to_string(),
             Expr::Unary(UnaryOp::Neg, inner) => self.infer_c_type(inner, var_types),
             Expr::Unary(UnaryOp::Not, _) => "bool".to_string(),
-            Expr::Unary(..) => "long".to_string(),
             Expr::Field(obj, field) => {
                 // Resolve the base's struct type, then look up the field's
                 // declared Kernel type and convert it -- falls back to

@@ -166,7 +166,37 @@ impl Interpreter {
                 return;
             }
         }
-        // new binding in the innermost scope
+        // Falls back to a REAL global write when `name` isn't any
+        // currently-live local -- a genuine, previously-real bug fix:
+        // this used to unconditionally create a brand-new LOCAL binding
+        // here instead, which meant `static mut COUNTER` mutations
+        // (e.g. `COUNTER += 1` inside a function) never actually
+        // persisted back to the global at all -- each call started
+        // fresh from the global's ORIGINAL value, incremented a
+        // throwaway local shadow, and returned that, silently
+        // discarding it when the function returned. Caught for real:
+        // calling the same `bump()` function three times in a row
+        // printed `1, 1, 1` on the interpreter while the C and LLVM
+        // native backends correctly printed `1, 2, 3` (both of those
+        // resolve a `static` identifier to one real, persistent memory
+        // location at compile time, so they never had this bug) -- a
+        // genuine cross-backend disagreement this project's own
+        // regression discipline exists to catch. Every current call
+        // site of set_var (Stmt::Assign/FieldAssign/IndexAssign/
+        // vec_push/vec_set) only ever targets a name that already
+        // exists as either a local (caught by the loop above) or a
+        // global (`let` is the only thing that introduces a BRAND NEW
+        // binding, and it writes directly into `self.scopes` itself,
+        // never through this function) -- so there is no legitimate
+        // case left that this fallback needs to treat as "a new local"
+        // instead.
+        if self.globals.contains_key(name) {
+            self.globals.insert(name.to_string(), value);
+            return;
+        }
+        // new binding in the innermost scope (defensive fallback only --
+        // see the reasoning above for why every real call site should
+        // already be caught by one of the two branches above it)
         self.scopes.last_mut().unwrap().insert(name.to_string(), value);
     }
 

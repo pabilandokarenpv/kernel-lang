@@ -1,0 +1,4 @@
+fn main():
+    let arr = [1, 2, 3]
+    arr[0] = 99
+    print(arr[0])

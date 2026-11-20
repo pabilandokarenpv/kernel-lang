@@ -1,0 +1,5 @@
+const X: int = 5
+
+fn main():
+    X = 99
+    print(X)

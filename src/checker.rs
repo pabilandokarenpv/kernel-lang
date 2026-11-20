@@ -57,6 +57,23 @@ fn is_array_type(ty: &str) -> bool {
     ty.starts_with('[')
 }
 
+// Finds the ROOT variable name behind an lvalue expression -- a plain
+// `Expr::Ident`, or (defensively, though interpreter/codegen currently
+// restrict FieldAssign's `object`/IndexAssign's `array` to a plain
+// ident anyway -- see ast.rs's own comment on IndexAssign) recursing
+// through `Expr::Field` to find the ident underneath a `p.x = ...`-
+// style target. Shared by the mutability checks on FieldAssign,
+// IndexAssign, and vec_push/vec_set below -- all four need the exact
+// same "what variable is actually being mutated here" answer.
+fn base_ident(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::Ident(n) => Some(n),
+        Expr::Field(obj, _) => base_ident(obj),
+        Expr::Borrow(inner, _) => base_ident(inner),
+        _ => None,
+    }
+}
+
 // `Vec<ElemType>` (v1.x, interpreter-only so far -- see
 // interpreter.rs's Value::Vec and the vec_new/vec_push/vec_get/
 // vec_len/vec_set builtins) -- same role as is_array_type, a non-Copy
@@ -72,6 +89,15 @@ struct VarState {
     moved: bool,
     shared_borrows: u32,
     exclusive_borrow: bool,
+    // Was this binding ever declared `mut`? Enforced by Stmt::Assign
+    // below -- reassigning a plain `let` (no `mut`) is a real safety-
+    // check error, not silently accepted. Always `true` for function
+    // PARAMETERS and `for`-loop induction variables: Kernel's grammar
+    // has no `mut`/non-`mut` distinction for either of those (see
+    // ast.rs's Param -- no `mutable` field at all), so there's nothing
+    // to enforce there; only `let` bindings can even express
+    // immutability in the first place.
+    declared_mut: bool,
 }
 
 pub struct Checker {
@@ -83,12 +109,24 @@ pub struct Checker {
     // Released back-to-front at the end of the block each entry was
     // created in — see release_borrows_to().
     borrow_stack: Vec<(String, bool)>,
+    // Module-level `static`/`const` names -> whether they were declared
+    // `static mut` (true) vs plain `static`/`const` (false, always for
+    // `const`). The local-scope move/mutability tracking above only
+    // ever sees FUNCTION-local names; this is the global-scope twin,
+    // consulted by Stmt::Assign when `name` isn't a known local at all
+    // -- closes the other half of the same gap `declared_mut` closes
+    // for `let` bindings (see Stmt::Assign's own comment for the real
+    // bug this was masking: a now-fixed interpreter.rs bug meant
+    // reassigning an immutable global silently never actually took
+    // effect, so this half of the check was never exercisable before).
+    global_mutable: HashMap<String, bool>,
 }
 
 impl Checker {
     pub fn new(program: &Program) -> Self {
         let mut structs = HashSet::new();
         let mut functions = HashMap::new();
+        let mut global_mutable = HashMap::new();
         for item in &program.items {
             match item {
                 Item::Struct(s) => {
@@ -97,10 +135,16 @@ impl Checker {
                 Item::Function(f) => {
                     functions.insert(f.name.clone(), f.clone());
                 }
+                Item::Static { name, mutable, .. } => {
+                    global_mutable.insert(name.clone(), *mutable);
+                }
+                Item::Const { name, .. } => {
+                    global_mutable.insert(name.clone(), false);
+                }
                 _ => {}
             }
         }
-        Checker { structs, functions, errors: Vec::new(), borrow_stack: Vec::new() }
+        Checker { structs, functions, errors: Vec::new(), borrow_stack: Vec::new(), global_mutable }
     }
 
     pub fn check(mut self, program: &Program) -> Vec<String> {
@@ -109,7 +153,7 @@ impl Checker {
                 let mut scope: HashMap<String, VarState> = HashMap::new();
                 for p in &f.params {
                     let copy = p.borrowed || (!self.structs.contains(&p.ty) && !is_array_type(&p.ty) && !is_vec_type(&p.ty));
-                    scope.insert(p.name.clone(), VarState { copy, moved: false, shared_borrows: 0, exclusive_borrow: false });
+                    scope.insert(p.name.clone(), VarState { copy, moved: false, shared_borrows: 0, exclusive_borrow: false, declared_mut: true });
                 }
                 let mark = self.borrow_stack.len();
                 self.check_block(&f.body, &mut scope, f.is_unsafe, &f.name);
@@ -205,6 +249,27 @@ impl Checker {
         }
     }
 
+    fn check_mutable_target(&mut self, name: &str, scope: &HashMap<String, VarState>, fn_name: &str) {
+        if let Some(state) = scope.get(name) {
+            if !state.declared_mut {
+                self.errors.push(format!(
+                    "[{}] cannot mutate `{}` -- it was declared with `let`, not `let mut`; add `mut` if it needs to change",
+                    fn_name, name
+                ));
+            }
+        } else if let Some(mutable) = self.global_mutable.get(name) {
+            // `name` isn't a local at all -- it's a module-level
+            // `static`/`const`. Same rule, the global half: a plain
+            // `static` (no `mut`) or any `const` can never be mutated.
+            if !mutable {
+                self.errors.push(format!(
+                    "[{}] cannot mutate `{}` -- it's a module-level `static`/`const` that was never declared `mut`; add `mut` to its `static` declaration if it needs to change (a `const` can never be reassigned at all)",
+                    fn_name, name
+                ));
+            }
+        }
+    }
+
     fn check_block(&mut self, stmts: &[Stmt], scope: &mut HashMap<String, VarState>, unsafe_ctx: bool, fn_name: &str) {
         for stmt in stmts {
             self.check_stmt(stmt, scope, unsafe_ctx, fn_name);
@@ -213,7 +278,7 @@ impl Checker {
 
     fn check_stmt(&mut self, stmt: &Stmt, scope: &mut HashMap<String, VarState>, unsafe_ctx: bool, fn_name: &str) {
         match stmt {
-            Stmt::Let { name, value, .. } => {
+            Stmt::Let { name, mutable, value, .. } => {
                 self.check_expr(value, scope, unsafe_ctx, fn_name);
                 if let Expr::Borrow(inner, exclusive) = value {
                     if let Expr::Ident(target) = inner.as_ref() {
@@ -221,21 +286,42 @@ impl Checker {
                     }
                 }
                 let copy = self.is_copy_expr(value, scope);
-                scope.insert(name.clone(), VarState { copy, moved: false, shared_borrows: 0, exclusive_borrow: false });
+                scope.insert(name.clone(), VarState { copy, moved: false, shared_borrows: 0, exclusive_borrow: false, declared_mut: *mutable });
             }
             Stmt::Assign { name, value, .. } => {
                 self.check_expr(value, scope, unsafe_ctx, fn_name);
+                // Reassigning a `let` that was never declared `mut` is a
+                // real safety-check error, not silently accepted --
+                // closes a real gap this project's own `mutable` AST
+                // field had been carrying since Stmt::Let was written,
+                // but nothing ever actually read it (confirmed by a
+                // real `cargo build` dead-code warning: "field `mutable`
+                // is never read"). check_mutable_target covers LOCALS
+                // and module-level `static`/`const` globals both.
+                self.check_mutable_target(name, scope, fn_name);
                 let copy = self.is_copy_expr(value, scope);
-                scope.insert(name.clone(), VarState { copy, moved: false, shared_borrows: 0, exclusive_borrow: false });
+                let declared_mut = scope.get(name).map(|s| s.declared_mut).unwrap_or(true);
+                scope.insert(name.clone(), VarState { copy, moved: false, shared_borrows: 0, exclusive_borrow: false, declared_mut });
             }
-            Stmt::FieldAssign { object, value, .. } => {
+            Stmt::FieldAssign { object, field: _, value } => {
                 self.check_expr(object, scope, unsafe_ctx, fn_name);
                 self.check_expr(value, scope, unsafe_ctx, fn_name);
+                // Mutating a field is mutating the struct it belongs to
+                // -- same rule as a plain `Stmt::Assign`, just applied
+                // to the ROOT variable behind `object` (see base_ident).
+                if let Some(root) = base_ident(object) {
+                    self.check_mutable_target(root, scope, fn_name);
+                }
             }
             Stmt::IndexAssign { array, index, value } => {
                 self.check_expr(array, scope, unsafe_ctx, fn_name);
                 self.check_expr(index, scope, unsafe_ctx, fn_name);
                 self.check_expr(value, scope, unsafe_ctx, fn_name);
+                // Same rule as FieldAssign above: `arr[i] = x` mutates
+                // the array variable itself.
+                if let Some(root) = base_ident(array) {
+                    self.check_mutable_target(root, scope, fn_name);
+                }
             }
             Stmt::If { arms, else_body } => {
                 let mut branch_outputs: Vec<HashMap<String, VarState>> = Vec::new();
@@ -318,7 +404,7 @@ impl Checker {
             Stmt::For { var, iter, body } => {
                 self.check_expr(iter, scope, unsafe_ctx, fn_name);
                 let mut branch_scope = scope.clone();
-                branch_scope.insert(var.clone(), VarState { copy: true, moved: false, shared_borrows: 0, exclusive_borrow: false });
+                branch_scope.insert(var.clone(), VarState { copy: true, moved: false, shared_borrows: 0, exclusive_borrow: false, declared_mut: true });
                 let mark = self.borrow_stack.len();
                 self.check_block(body, &mut branch_scope, unsafe_ctx, fn_name);
                 self.release_borrows_to(mark, &mut branch_scope);
@@ -448,6 +534,20 @@ impl Checker {
                             CallArg::Named(_, e) => e,
                         };
                         self.check_expr(inner, scope, unsafe_ctx, fn_name);
+                    }
+                    // vec_push/vec_set actually MUTATE their first
+                    // argument's Vec (vec_get/vec_len/vec_new don't) --
+                    // same rule as FieldAssign/IndexAssign above, same
+                    // base_ident extraction.
+                    if matches!(name.as_str(), "vec_push" | "vec_set") {
+                        if let Some(first) = args.first() {
+                            let e = match first {
+                                CallArg::Positional(e) | CallArg::Named(_, e) => e,
+                            };
+                            if let Some(root) = base_ident(e) {
+                                self.check_mutable_target(root, scope, fn_name);
+                            }
+                        }
                     }
                     return;
                 }

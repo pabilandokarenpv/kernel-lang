@@ -1,0 +1,8 @@
+static COUNTER: int = 0
+
+fn bump():
+    COUNTER = 99
+
+fn main():
+    bump()
+    print(COUNTER)

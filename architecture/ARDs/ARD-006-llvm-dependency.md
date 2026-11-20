@@ -1,22 +1,8 @@
-# ARD-004: taking on `inkwell`/LLVM as the one external dependency
+# ARD-006: taking on `inkwell`/LLVM as the one external dependency
 
 **Status:** Accepted (v2)
 
-**Note on this file's history:** ARD-001 through ARD-004 have been
-referenced from code comments across this project (`codegen_c.rs`,
-`json.rs`, `lsp.rs`, `monomorphize.rs`, `parser.rs`, `README.md`) as
-living in `engineering/architecture/ARDs/` since well before this
-particular decision -- but that directory never actually existed on
-disk; every one of those references has been a phantom pointer until
-now. This file is written retroactively, honestly, for the ONE decision
-it's actually needed to anchor (this session's `inkwell` dependency,
-which is the thing that makes ARD-004's older "no external deps"
-framing no longer simply true) -- it does not attempt to reconstruct
-ARD-001/002/003's original content from inference, which would be
-fabrication, not documentation. Those three remain a real, pre-existing
-documentation gap, named here rather than silently papered over.
-
-## Decision
+## Context
 
 Every stage of this project through v1.x was hand-rolled on purpose: no
 parser-generator, no external JSON crate (see `json.rs`), no existing
@@ -24,7 +10,10 @@ compiler-backend crate -- codegen targeted raw C text directly
 (`codegen_c.rs`). The reasoning, consistently: this project's whole point
 is PROVING each stage of a real compiler pipeline end to end, which a
 pulled-in library would short-circuit for the exact stage meant to be
-proven.
+proven. That "no external dependencies" discipline is what `json.rs`,
+`lsp.rs`, and `manifest.rs`'s own doc comments point back to.
+
+## Decision
 
 v2's native backend (RFC-003) breaks that pattern on purpose: it depends
 on `inkwell` (a safe wrapper over `llvm-sys`/LLVM 18).
@@ -41,8 +30,8 @@ learning/demonstration compiler; hand-rolling it would be reinventing a
 genuinely separate, enormous piece of software, not practicing compiler
 construction. The actual compiler-construction work in RFC-003 is
 `codegen_llvm.rs` itself: translating this project's own AST into LLVM
-IR correctly (including two real, subtle bugs it already caught -- see
-RFC-003's "cross-backend verification" section) -- LLVM's job starts
+IR correctly (including several real, subtle bugs it already caught --
+see RFC-003's "cross-backend verification" section) -- LLVM's job starts
 only after that IR already exists.
 
 ## What this costs
@@ -55,10 +44,11 @@ only after that IR already exists.
   features = ["llvm18-1"] }`) -- this project's first.
 - `codegen_llvm.rs` carries real, LLVM-specific unsafety/complexity
   (opaque pointers, basic-block/phi construction for short-circuit
-  booleans, two-pass struct-type registration) that `codegen_c.rs`
-  never had to -- C text generation is comparatively trivial by
-  comparison; this is the actual price of a REAL native backend instead
-  of transpiling to another high-level language again.
+  booleans, two-pass struct-type registration, real `TargetData`-backed
+  ABI-size queries for `Vec<T>`) that `codegen_c.rs` never had to -- C
+  text generation is comparatively trivial by comparison; this is the
+  actual price of a REAL native backend instead of transpiling to
+  another high-level language again.
 
 ## What this doesn't change
 
@@ -68,3 +58,19 @@ only after that IR already exists.
   checker, interpreter, the LSP's own JSON-RPC framing) is unchanged.
   LLVM is the one deliberate, named exception, not a crack in the
   principle.
+
+## Note on this ARD's numbering
+
+This decision was first written up mid-session under the filename
+`ARD-004-llvm-dependency.md`, in a directory
+(`engineering/architecture/ARDs/`) that doesn't match this project's
+actual, established convention (`architecture/ARDs/` at the repo root,
+which has held ARD-001 through ARD-005 since before this decision was
+made) -- and `ARD-004` collided with the real, pre-existing
+`ARD-004-rust-as-implementation-language.md`, a completely different
+decision. Both mistakes came from the same root cause: incorrectly
+assuming the `architecture/ARDs/` directory never existed on disk,
+without actually checking. Fixed by moving this file here, renumbering
+it to the next real available slot (ARD-006), and correcting every
+`(see ARD-004)`-style reference across the codebase that actually meant
+THIS decision to say ARD-006 instead.

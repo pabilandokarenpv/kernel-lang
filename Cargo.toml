@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# First external dependency this project has ever taken on (see ARD-004 --
+# First external dependency this project has ever taken on (see ARD-006 --
 # everything else, lexer/parser/checker/interpreter/C-codegen/JSON-for-the-
 # LSP, is hand-rolled). LLVM itself is the one piece genuinely not worth
 # re-implementing: codegen_llvm.rs (v2's real native backend, see RFC-003)

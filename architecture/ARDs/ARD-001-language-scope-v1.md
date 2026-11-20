@@ -62,3 +62,19 @@ the checker/interpreter/codegen.
 - Known, documented gap (not a silent one): generics/traits/enums exist in
   the syntax spec already, so growing the grammar later is extension, not
   a breaking redesign.
+
+## Revision 1: generics, pattern matching, and closures implemented as v1.x extensions
+
+This ARD's "no generics, traits, pattern matching, or closures" scope was
+accurate for v1's initial ship. All three of generics (functions and
+structs, via monomorphization), pattern matching (`match`, via parse-time
+desugaring to `if`/`elif`), and closures (via lambda-lifting to plain
+functions with explicit captures) were implemented afterward as v1.x
+additions -- each erased by an AST-to-AST pass before the checker ever
+sees it, matching ARD-002's "no separate IR, keep each stage simple"
+philosophy. Traits and Rust-style tagged-union enums with associated data
+remain genuinely out of scope, unchanged from the original decision. A
+real growable collection (`Vec<T>`) was also added, with real codegen on
+the interpreter and the LLVM native backend (ARD-006) -- the freestanding
+C backend explicitly rejects it (no heap allocator). See RFC-002's "v1.x
+additions" section for the full, current, honest scope of each.

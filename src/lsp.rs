@@ -1,6 +1,6 @@
 // Kernel (.kn) LSP server -- v1.x, "basic real IDE support" (Option C's
 // first slice). Hand-rolled JSON-RPC over stdio (see json.rs), same
-// no-external-dependencies identity as the rest of this project (ARD-004).
+// no-external-dependencies identity as the rest of this project (ARD-006).
 // Reuses the EXACT SAME pipeline main.rs's `kernel run`/`kernel build` use
 // (lex -> parse -> monomorphize -> lambda_lift -> check) -- a diagnostic
 // reported here means the exact same program would really fail to

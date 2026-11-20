@@ -666,7 +666,7 @@ Stated as plainly as the project's own internal architecture decision records (A
 | Backend 1 | Transpile to **C**, then **GCC** (compiler) + **GNU `as`** (assembler) + **GNU `ld`** (linker) | Shortest realistic path from "checked AST" to "boots in QEMU" |
 | Boot standard | **Multiboot Specification** (GNU) | Lets any Multiboot-compliant bootloader (GRUB, QEMU's own loader) boot a Kernel-compiled binary with zero custom bootloader code |
 | Verification environment | **QEMU** (`qemu-system-i386`) | Free, open-source machine emulation — verifies real boot behavior without needing physical hardware |
-| Backend 2 | **LLVM** via the `inkwell` Rust bindings (LLVM 18) | Real native machine code for the host OS — this project's first and only external dependency (see `engineering/architecture/ARDs/ARD-004-llvm-dependency.md`): LLVM's instruction-selection/register-allocation/optimization pipeline is a multi-decade effort not worth reinventing to prove this project's point |
+| Backend 2 | **LLVM** via the `inkwell` Rust bindings (LLVM 18) | Real native machine code for the host OS — this project's first and only external dependency (see `architecture/ARDs/ARD-006-llvm-dependency.md`): LLVM's instruction-selection/register-allocation/optimization pipeline is a multi-decade effort not worth reinventing to prove this project's point |
 | Dev tooling | Hand-rolled LSP server (`src/lsp.rs`) + hand-rolled JSON parsing (`src/json.rs`) | Zero dependencies for the JSON-RPC/LSP layer either — matches the project's "no external crates unless truly justified" discipline everywhere except LLVM itself |
 
 ---
@@ -771,8 +771,9 @@ kernel-lang/
 │                            rejected ones used as checker test cases
 ├── scripts/
 │   └── regression.sh      — automated 3-backend regression sweep
+├── architecture/ARDs/     — Architecture Decision Records (ARD-001
+│                            through ARD-006)
 ├── engineering/
-│   ├── architecture/ARDs/ — Architecture Decision Records
 │   └── RFCs/              — RFC-001 (system architecture), RFC-002
 │                            (grammar specification), RFC-003 (LLVM
 │                            native backend)

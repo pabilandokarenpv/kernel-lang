@@ -228,7 +228,7 @@ in the editor and reports `textDocument/publishDiagnostics` -- a reported
 diagnostic means the same program would really fail to run/build, never a
 separate "IDE-only" analysis that could drift from what the compiler
 actually enforces. Hand-rolled JSON-RPC/JSON (`json.rs`), no external
-crates, matching ARD-004's identity.
+crates, matching ARD-006's identity.
 
 Honest v1.x scope:
 - Diagnostics only -- no hover, go-to-definition, completion, or

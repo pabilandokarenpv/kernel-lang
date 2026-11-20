@@ -10,3 +10,4 @@ it, the alternatives considered, and the consequences we accepted.
 | [ARD-003](./ARD-003-ownership-checker-scope.md) | Ownership checker: move-checking with control-flow merge, plus borrow-conflict detection (lexically scoped, not full NLL) | Accepted |
 | [ARD-004](./ARD-004-rust-as-implementation-language.md) | Compiler implementation language: Rust | Accepted |
 | [ARD-005](./ARD-005-universal-backend-philosophy.md) | Universal backend philosophy: one checked AST, many pluggable targets, no per-domain forks | Accepted |
+| [ARD-006](./ARD-006-llvm-dependency.md) | Taking on `inkwell`/LLVM as the one external dependency (v2 native backend) | Accepted |

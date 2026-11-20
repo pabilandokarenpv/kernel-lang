@@ -1,5 +1,5 @@
 // Minimal hand-rolled JSON -- matches this project's own "hand-roll the
-// pipeline, no parser-generator/external crates" identity (see ARD-004),
+// pipeline, no parser-generator/external crates" identity (see ARD-006),
 // extended here to the LSP server's wire format (see lsp.rs). NOT a
 // general-purpose JSON library: just enough to parse/build the specific
 // message shapes LSP's JSON-RPC framing actually uses (objects, arrays,

@@ -103,7 +103,7 @@ $ kernel init myproject                        # scaffold a new project (kernel.
   text-mode runtime, multiboot1 boot glue (`kernel build`)
 - `src/codegen_llvm.rs` — real native codegen via `inkwell`/LLVM 18
   (`kernel build-native`) — this project's first and only external
-  dependency (see `engineering/architecture/ARDs/ARD-004-llvm-dependency.md`)
+  dependency (see `architecture/ARDs/ARD-006-llvm-dependency.md`)
 - `src/lsp.rs` + `src/json.rs` — hand-rolled LSP server, zero deps
 - `src/manifest.rs` — `kernel.toml` parsing + `kernel init`
 - `editors/vscode/`, `editors/nvim/` — real, tested editor integrations

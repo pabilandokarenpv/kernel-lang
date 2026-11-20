@@ -12,7 +12,7 @@
 // Format: flat `key = "value"` lines, NOT full TOML (no `[sections]`,
 // no nested tables, no arrays) -- intentionally the smallest useful
 // subset, hand-parsed with no dependency, matching this project's
-// no-external-crates identity (see ARD-004). Blank lines and lines
+// no-external-crates identity (see ARD-006). Blank lines and lines
 // starting with `#` are ignored.
 
 use std::fs;

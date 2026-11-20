@@ -6,7 +6,7 @@
 
 `kernel build-native` lowers the checked AST straight to LLVM IR (via
 `inkwell`, this project's first external dependency -- see Cargo.toml's
-comment and ARD-004) and emits a real native executable for the host OS,
+comment and ARD-006) and emits a real native executable for the host OS,
 linked against its real libc. This is NOT another way to build a
 freestanding kernel image (that's `kernel build` / `codegen_c.rs`,
 unchanged) -- it's the "backend/server" half of the original roadmap, a
@@ -27,7 +27,7 @@ flowchart TD
 
 Every other stage in this project is hand-rolled on purpose (lexer,
 parser, checker, interpreter, C codegen, even the LSP's JSON encoding --
-see ARD-004). LLVM is different: its actual reason to exist is a mature,
+see ARD-006). LLVM is different: its actual reason to exist is a mature,
 decades-deep instruction-selection/register-allocation/optimization
 pipeline. Hand-rolling that would be reinventing a real compiler
 backend's core, not "proving the pipeline" the way the rest of this

@@ -186,9 +186,55 @@ fn main():
 
 That `raw_write(757504, 35)` call writes directly to VGA text-mode memory — address 757504 is a specific byte in the screen's character buffer, and 35 is the ASCII code for `#`. Running the *compiled* version of this program in QEMU makes a `#` character genuinely appear on the emulated screen, at the exact position that address maps to.
 
+```mermaid
+flowchart LR
+    PROGNODE["Program"] --> FNNODE["Function<br/>fn name(params) -> type:"]
+    PROGNODE --> STRUCTNODE["Struct"]
+    PROGNODE --> ENUMNODE["Enum<br/>(C-style, desugars to<br/>flat int constants)"]
+    FNNODE --> STMTNODE["Statement"]
+    STMTNODE --> LETNODE["let (move-by-default binding)"]
+    STMTNODE --> REASSIGNNODE["reassignment"]
+    STMTNODE --> IFNODE["if / elif / else"]
+    STMTNODE --> WHILENODE["while"]
+    STMTNODE --> FORRANGENODE["for v in lo..hi"]
+    STMTNODE --> UNSAFENODE["unsafe block<br/>(raw memory: MMIO, pointers)"]
+    STMTNODE --> PRINTNODE["print(...)"]
+    STMTNODE --> RETURNNODE["return"]
+    STMTNODE --> EXPRNODE["expression:<br/>+ - * % comparisons"]
+
+    style UNSAFENODE fill:#4a1a1a,stroke:#822,color:#fff
+```
+
+**Walkthrough**: this is Kernel's actual grammar tree — every real `.kn` program is built entirely out of these pieces, nothing else. A `Program` is just a list of functions, structs, and enums; a function's body is a list of statements; and the statement list is exactly the nine kinds shown here, no more, in v1. The `unsafe block` node is colored differently on purpose — it's the single statement type that behaves differently from every other one: it's the only place the checker *relaxes* its rules rather than enforcing them, which is exactly why it has to be visually and syntactically distinct rather than an ordinary statement. Notice "generics," "traits," "pattern matching," and "closures" don't appear anywhere in this diagram — not because they're unplanned, but because (per [Section 8](#8-whats-implemented-vs-whats-deliberately-deferred-v1-scope)) they're specified in the grammar document for future versions but genuinely not implemented in v1's parser yet.
+
 ---
 
 ## 5. The Compiler Pipeline, Stage by Stage
+
+```mermaid
+flowchart TB
+    SRC["📄 your_program.kn<br/>(indentation-based source)"] --> LEX["Lexer<br/>src/lexer.rs"]
+    LEX --> TOK["Token stream<br/>(Indent/Dedent tracked)"]
+    TOK --> PARSE["Parser<br/>src/parser.rs<br/>(recursive descent)"]
+    PARSE --> TREE["AST<br/>src/ast.rs"]
+    TREE --> CHECK["Checker<br/>src/checker.rs<br/>(move/ownership + unsafe)"]
+    CHECK -->|"rejected"| ERR["❌ Compile error,<br/>nothing runs"]
+    CHECK -->|"passes"| SPLIT{"kernel run<br/>or<br/>kernel build?"}
+    SPLIT -->|"run"| INTERP["Interpreter<br/>src/interpreter.rs"]
+    INTERP --> OUT1["Program output<br/>(printed immediately)"]
+    SPLIT -->|"build"| CODEGEN["Codegen<br/>src/codegen_c.rs"]
+    CODEGEN --> CSRC["Generated C source"]
+    CSRC --> NATIVE["gcc + as + ld<br/>+ kernel_runtime/"]
+    NATIVE --> BIN["Freestanding binary<br/>out.bin"]
+    BIN --> QEMUBOOT["QEMU<br/>qemu-system-i386"]
+    QEMUBOOT --> OUT2["Boots for real,<br/>pixel-exact vs OUT1"]
+
+    style ERR fill:#4a1a1a,stroke:#822,color:#fff
+    style OUT1 fill:#1a3a1a,stroke:#4a8,color:#fff
+    style OUT2 fill:#1a3a1a,stroke:#4a8,color:#fff
+```
+
+**Walkthrough**: every `.kn` file travels down the same left side of this diagram no matter what — lexer, parser, checker — and the checker is a real fork in the road: fail here and nothing downstream ever runs (the red box), which is the whole point of a safety checker living *before* execution rather than catching bugs at runtime. Once checked, the diagram branches into Kernel's two genuinely different output modes: the left branch (`kernel run`) is for fast iteration while writing code — straight to the interpreter, output on screen immediately. The right branch (`kernel build`) is the slower, heavier path that proves the language is real: the same checked AST gets turned into C, that C gets handed to completely standard, decades-old tools (`gcc`/`as`/`ld`) that have never heard of Kernel, and the result is a binary that QEMU can boot like any other operating system image. The two green boxes at the bottom are the actual verification: the same program's output from both paths is compared and must match exactly.
 
 Every `.kn` file passes through the same five stages, implemented as five separate Rust source files that each do exactly one job:
 
@@ -222,6 +268,25 @@ This is Kernel's central technical bet, so it's worth explaining precisely what 
 
 **What it does**: every value has one owner. Assigning or passing a value moves ownership by default — the original variable becomes unusable afterward. `&` lets you temporarily borrow a value (read/inspect it) without taking ownership, so the original stays usable. The checker enforces both rules at compile time, and — critically — it does this correctly *across control flow*: if a value might have been moved on just one branch of an `if`, or on a previous pass through a loop, the checker still catches a later use as an error, rather than only catching the simplest straight-line case.
 
+```mermaid
+flowchart TB
+    subgraph branchcheck["Move-checking across if / elif / else"]
+        B0["Before the if:<br/>origin is valid"] --> B1["if arm:<br/>origin moved here"]
+        B0 --> B2["else arm:<br/>origin NOT moved here"]
+        B1 --> MERGEPOINT["Merge point<br/>(right after the if)"]
+        B2 --> MERGEPOINT
+        MERGEPOINT --> RESULTNODE["origin is marked MOVED<br/>in the parent scope —<br/>conservative: 'might have been<br/>moved on any branch, so<br/>treat as moved everywhere after'"]
+    end
+
+    subgraph loopcheck["Move-checking across loop re-iteration"]
+        L0["Loop body,<br/>pass 1 (normal scope)"] --> L1["value moved once"]
+        L1 --> L2["Loop body,<br/>pass 2 (seeded with<br/>pass 1's end state)"]
+        L2 --> L3["second use of the same value,<br/>now correctly flagged as<br/>re-move-on-next-iteration"]
+    end
+```
+
+**Walkthrough**: these are the two genuinely hard cases move-checking has to get right, and both are shown as two-pass processes because a single straight-through scan isn't enough for either. Top half: when an `if` has multiple arms, the checker evaluates each arm *separately* against its own copy of the scope (so a borrow-only `else` arm doesn't get falsely flagged just because the `if` arm happened to move something) — then, critically, it merges the results afterward by taking the *most conservative* answer: if the value was moved on even one reachable path, it's treated as moved for everything that follows, regardless of which path actually ran at runtime. Bottom half: a loop's body isn't just checked once — it's checked a *second* time, seeded with whatever the state looked like at the *end* of the first pass, specifically to simulate "what if this loop actually runs twice." A bug that only shows up in that second pass (like reusing a value that pass 1 already moved) is exactly the re-iteration bug class this catches.
+
 **What it deliberately doesn't do (yet)**: Rust's *complete* borrow checker also detects simultaneous mutable/immutable borrow conflicts (e.g., holding a mutable reference and a regular reference to the same data at the same time) — this is a substantially harder static-analysis problem, formally the subject of real ongoing PL research (see Rust's own Non-Lexical Lifetimes work and the Oxide formalization paper, both cited in [Section 15](#15-research-references-and-official-documentation)). Kernel v1 does not implement this half of the problem — it's named explicitly as deferred work, not silently missing.
 
 **The actual trade-off, stated plainly**: Kernel gets you real, compiler-enforced protection against an entire class of memory bugs (use-after-move/use-after-free-equivalent) with zero lifetime annotations to write, in exchange for *not yet* catching a narrower, harder class of bugs (simultaneous aliasing conflicts) that Rust's full borrow checker does catch. This isn't "as safe as Rust" — it's a real, honestly-scoped subset.
@@ -238,6 +303,28 @@ This is the part that proves the compiler pipeline actually works end to end, no
 4. `kernel_runtime/link.ld` (a linker script) tells the linker exactly where in memory each piece of the final binary must be placed, matching what a Multiboot-compliant bootloader expects
 5. The result is a single freestanding binary, `out.bin`
 6. `qemu-system-i386 -kernel out.bin` boots it in a real x86 emulator — QEMU recognizes the Multiboot header, loads the binary exactly as a real bootloader would, and execution begins at the entry point defined in `boot.s`
+
+```mermaid
+sequenceDiagram
+    participant Dev as Developer
+    participant CLI as kernel build
+    participant GCC as gcc + as + ld
+    participant Bin as out.bin
+    participant Emu as QEMU
+
+    Dev->>CLI: kernel build examples/boot_demo.kn out.bin
+    CLI->>CLI: lex, parse, check, generate C source
+    CLI->>GCC: hand off C source + kernel_runtime/<br/>(boot.s, link.ld, runtime.c)
+    GCC->>Bin: produce a freestanding binary,<br/>Multiboot header included
+    Dev->>Emu: qemu-system-i386 -kernel out.bin
+    Emu->>Bin: recognize the Multiboot header,<br/>load the binary into emulated memory
+    Bin->>Bin: boot.s entry point runs first,<br/>before any C code
+    Bin->>Bin: hands off to the generated C main()
+    Bin->>Emu: raw_write() writes directly<br/>to VGA memory
+    Emu-->>Dev: character appears on the emulated screen,<br/>pixel-exact vs. the interpreter's output
+```
+
+**Walkthrough**: this is the exact sequence that happens behind the single command `kernel build ... && qemu-system-i386 -kernel out.bin`, spelled out step by step. Notice the handoff pattern: the developer never talks to `gcc` or QEMU's internals directly — `kernel build` is the only thing that knows how to orchestrate the C compiler and the Kernel-specific runtime glue together, and QEMU is the only thing that knows how to interpret the Multiboot header `boot.s` wrote into the binary. The two `Bin->>Bin` steps in the middle are the moment that actually matters most: `boot.s` (hand-written assembly, not generated from your `.kn` code at all) has to run *first*, because it's what sets up the minimal environment (stack, memory layout per `link.ld`) that the generated C code from *your* program assumes already exists by the time it starts running. Only after that handoff does anything resembling "your program" actually execute.
 
 The verification isn't "it compiles without errors" — it's that the *actual rendered output on the emulated screen* matches, character for character, what the same program produces when run through the interpreter instead. Including the raw `write_vga` MMIO call landing on the exact byte address specified.
 
@@ -310,6 +397,24 @@ Kernel is not claiming to be "as capable as Rust" today — it's a from-scratch 
 ## 12. The Long-Term Roadmap
 
 Every future stage adds a **new backend** consuming the same checked AST that v1's frontend already produces — never a fork of the frontend into a separate dialect. This is a deliberate architectural principle (see ARD-005, cited below), specifically to avoid the fragmentation problem of needing a different language per target (the exact problem Kernel is trying to solve, not recreate).
+
+```mermaid
+flowchart TB
+    FRONTENDNODE["Shared frontend<br/>lexer → parser → checker<br/>(the SAME checked AST for every target below)"]
+    FRONTENDNODE --> V1NODE["v1: C → gcc/as/ld<br/>Systems/kernel-level<br/>(current, complete)"]
+    FRONTENDNODE --> V2NODE["v2: LLVM (inkwell)<br/>Native performance / backend / server"]
+    FRONTENDNODE --> V3NODE["v3: WASM<br/>Web"]
+    FRONTENDNODE --> V4NODE["v4: Native FFI / WASM+WebView<br/>Mobile"]
+    FRONTENDNODE --> V5NODE["v5: Kernel UI,<br/>built in Kernel itself on v3/v4<br/>Full-stack apps"]
+    FRONTENDNODE --> V6NODE["v6: stdlib/type addition<br/>on top of v2's LLVM target<br/>ML"]
+    FRONTENDNODE --> V7NODE["v7: compiles to Qiskit/OpenQASM<br/>Quantum computing"]
+    FRONTENDNODE --> V8NODE["v8: C backend, no_std mode<br/>Embedded/Arduino"]
+    FRONTENDNODE --> V9NODE["v9: EVM bytecode /<br/>WASM contract format<br/>Blockchain"]
+
+    style V1NODE fill:#1a3a1a,stroke:#4a8,color:#fff
+```
+
+**Walkthrough**: the whole point of this diagram is that it's a star shape, not a chain — every one of the nine boxes connects directly back to the *same* single frontend box at the top, none of them connect to each other. That's the actual architectural commitment: adding v7 (quantum computing) doesn't touch, require, or risk breaking v3 (web), because neither of them forked the lexer/parser/checker to get their own version — they both just consume the identical checked AST that's already been validated as syntactically and ownership-safe, and each backend's own job is purely "turn this already-correct tree into *my* target format." v1 (green) is the only box that's actually built — every other box is a planned, researched target, not a parallel work-in-progress, which is also why the diagram only has one edge actually "lit up" so far.
 
 | Stage | Target | Backend | What it unlocks |
 |---|---|---|---|

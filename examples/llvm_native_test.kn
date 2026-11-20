@@ -1,0 +1,29 @@
+struct Point:
+    x: int
+    y: int
+
+const GREETING: str = "native codegen works"
+static mut COUNTER: int = 0
+
+fn make_point(a: int, b: int) -> Point:
+    return Point(x: a, y: b)
+
+fn distance_sq(p: Point) -> int:
+    return p.x * p.x + p.y * p.y
+
+fn bump() -> int:
+    COUNTER += 1
+    COUNTER += 1
+    return COUNTER
+
+fn main():
+    let p = make_point(3, 4)
+    print(p.x)
+    print(p.y)
+    print(distance_sq(p))
+    print(GREETING)
+    print(bump())
+    let ok = true && false
+    let also_ok = true || false
+    print(ok)
+    print(also_ok)

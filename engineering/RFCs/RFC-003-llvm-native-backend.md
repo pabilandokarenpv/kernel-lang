@@ -1,0 +1,114 @@
+# RFC-003: native LLVM backend — a real second target, not a second kernel
+
+**Status:** Implemented (v2, first slice)
+
+## Summary
+
+`kernel build-native` lowers the checked AST straight to LLVM IR (via
+`inkwell`, this project's first external dependency -- see Cargo.toml's
+comment and ARD-004) and emits a real native executable for the host OS,
+linked against its real libc. This is NOT another way to build a
+freestanding kernel image (that's `kernel build` / `codegen_c.rs`,
+unchanged) -- it's the "backend/server" half of the original roadmap, a
+genuinely different target: a normal `main()`, real `printf`, no VGA
+text-mode hand-rolling, no `-ffreestanding`, no QEMU needed to run it at
+all.
+
+```mermaid
+flowchart TD
+    AST["checked AST\n(same load_checked() as every other backend)"] --> LLVM["codegen_llvm.rs\nAST -> LLVM IR via inkwell"]
+    LLVM --> VERIFY["module.verify()\n(a verification failure is a\nreal codegen bug, not a\nKernel-level error)"]
+    VERIFY --> OBJ["TargetMachine::write_to_file\n(native object file, host triple)"]
+    OBJ --> CC["cc obj.o -o out\n(real libc link, no custom\nruntime/boot/linker-script)"]
+    CC --> BIN["real ELF/Mach-O executable\n-- run it directly, no QEMU"]
+```
+
+## Why LLVM gets to be the one dependency
+
+Every other stage in this project is hand-rolled on purpose (lexer,
+parser, checker, interpreter, C codegen, even the LSP's JSON encoding --
+see ARD-004). LLVM is different: its actual reason to exist is a mature,
+decades-deep instruction-selection/register-allocation/optimization
+pipeline. Hand-rolling that would be reinventing a real compiler
+backend's core, not "proving the pipeline" the way the rest of this
+project does. `inkwell` is a thin, safe wrapper over `llvm-sys`; LLVM 18
+itself (via `llvm-18-dev`, `libpolly-18-dev`, `libzstd-dev` on
+Debian/Ubuntu) is the actual dependency.
+
+## Honest v1.x scope for this first slice
+
+Supported, verified end to end (byte-for-byte output parity against the
+interpreter, confirmed across the full example suite -- 12/20 existing
+examples run unchanged, the rest are the named gaps below):
+
+- Functions (including recursion, forward calls -- two-pass declare/
+  define, same reasoning as `codegen_c.rs`), `if`/`elif`/`else`, `while`,
+  `for`-in-range, `return`.
+- `int`/`float`/`bool`/`str` (string literals, printing, passing as
+  args -- NOT concatenation, see below), structs (construction, field
+  read/write, by-value params and returns, nested field access).
+- Borrows (`&T`/`&mut T`) -- same scope as `codegen_c.rs`: field access
+  through a borrowed PARAMETER works; field access through a locally
+  `let`-bound borrow does not (an accepted limit carried over, not a new
+  one -- see codegen_llvm.rs's FnCtx::is_ptr doc comment).
+- `print` (real libc `printf`, one dynamically-built format string per
+  call site) and `abs` (manual `select`-based implementation, no libm
+  dependency needed for something this simple).
+- Top-level `static`/`const` (including desugared enum variants) as real
+  LLVM globals.
+- REAL short-circuit `&&`/`||` (actual branching + a phi, not a simple
+  bitwise and/or) -- deliberately not simpler-than-necessary here, since
+  C's `&&`/`||` (what `codegen_c.rs` emits) really does short-circuit,
+  and two backends silently disagreeing on an operator's semantics is
+  exactly what this project's "backends must agree" discipline exists to
+  catch before it ships.
+
+NOT yet supported -- every one of these is REJECTED with a clear, named
+error at codegen time (never a silent miscompile or a confusing linker
+error), same "fail loud" convention as every other gap in this project:
+
+- Fixed-size arrays (`[T;N]`) and `len()` on them -- real extra work
+  (GEP-based indexing, bounds-check branching) not done in this slice.
+- String concatenation (`+`/`+=` on `str`) -- needs a real allocation
+  story for a libc-backed target (malloc-based, unlike the freestanding
+  backend's rotating-buffer trick) that hasn't been designed yet.
+- `read_file`/`write_file` -- interpreter-only dev convenience; `kernel
+  run` is the right tool for programs that need them.
+- `unsafe`/`raw_write` (MMIO) -- meaningless on a normal userspace
+  process; `kernel build` (the freestanding C backend) is the right tool.
+- Cross-compilation -- this always targets the HOST's own triple.
+
+## Two real native-codegen bugs caught by cross-backend verification
+
+Building `examples/multi_shared_borrow_ok.kn` surfaced two genuine bugs,
+both found specifically BECAUSE output was compared against the
+interpreter rather than just "did it compile":
+
+1. Loading a locally `let`-bound borrow (`let r1 = &origin`) used the
+   WRONG LLVM type for the load (the pointee's struct type instead of
+   `ptr`), silently reading the wrong number of bytes from the wrong
+   place -- printed a garbage pointer bit-pattern instead of `5`.
+2. Passing that same borrow onward as a call argument (`peek(r1)`) took
+   the ADDRESS OF `r1`'s own storage slot instead of `r1`'s VALUE (which
+   is already the correct pointer) -- the classic "value vs. place"
+   confusion. Fixed by always using `gen_expr` (never `gen_addr`) for
+   call arguments, matching `codegen_c.rs`'s `call_arg`, which never
+   special-cased borrowed parameters either -- the argument EXPRESSION
+   already produces the right value on its own.
+
+Both are now covered by `examples/multi_shared_borrow_ok.kn` (pre-
+existing) and `examples/llvm_native_test.kn` (new -- struct-returning
+functions, global const/static, short-circuit booleans).
+
+## Verified
+
+- `kernel build-native examples/hello.kn /tmp/hello_native` -> a real
+  ELF executable (`file` confirms: dynamically linked, not stripped),
+  run DIRECTLY with no QEMU, exit code 0, stdout `15` -- matching the
+  interpreter exactly.
+- Full example suite swept through `build-native`: 12 pass with exact
+  interpreter-parity output, 8 fail with the clear, named rejections
+  listed above -- zero silent wrong output anywhere.
+- `kernel build` (C/freestanding backend) re-verified unaffected (same
+  clean QEMU boot as before) -- this slice only adds a new backend, it
+  doesn't touch the existing one.

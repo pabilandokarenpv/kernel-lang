@@ -1,6 +1,7 @@
 mod ast;
 mod checker;
 mod codegen_c;
+mod codegen_llvm;
 mod interpreter;
 mod json;
 mod lambda_lift;
@@ -40,6 +41,11 @@ fn main() {
             let path = resolve_entry_path(args.get(2).map(|s| s.as_str()));
             let out = args.get(3).map(|s| s.as_str()).unwrap_or("kernel.bin");
             cmd_build(&path, out);
+        }
+        Some("build-native") => {
+            let path = resolve_entry_path(args.get(2).map(|s| s.as_str()));
+            let out = args.get(3).map(|s| s.as_str()).unwrap_or("kernel_native");
+            cmd_build_native(&path, out);
         }
         Some("trace") => {
             let path = resolve_entry_path(args.get(2).map(|s| s.as_str()));
@@ -199,6 +205,23 @@ fn cmd_build(path: &str, out: &str) {
         .arg(&kmain_o)
         .arg(&runtime_o));
 
+    println!("built: {}", out);
+}
+
+fn cmd_build_native(path: &str, out: &str) {
+    // v2's real native backend (Option B, RFC-003) -- see
+    // codegen_llvm.rs's doc comment for the full honest scope. Unlike
+    // cmd_build above (freestanding C -> a bare-metal kernel image booted
+    // under QEMU), this produces a normal, directly-runnable executable
+    // for the HOST OS, linked against its real libc.
+    let program = load_checked(path);
+    let build_dir = "/tmp/kernel_build_native";
+    fs::create_dir_all(build_dir).unwrap();
+    let obj_path = format!("{}/kernel.o", build_dir);
+    codegen_llvm::compile_to_object(&program, Path::new(&obj_path));
+    println!("generated object file: {}", obj_path);
+
+    run(Command::new("cc").arg(&obj_path).arg("-o").arg(out));
     println!("built: {}", out);
 }
 

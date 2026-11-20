@@ -1,0 +1,962 @@
+// Kernel (.kn) LLVM codegen -- v2 real native backend (Option B, RFC-003).
+//
+// Unlike codegen_c.rs (which emits -ffreestanding C for a bare-metal
+// kernel booting under QEMU/real hardware, no OS, no libc, hand-rolled
+// VGA text-mode print routines), this backend targets a REAL NATIVE
+// EXECUTABLE for the host OS: a normal `main()`, linked against the
+// system's real libc, printing through real `printf`. This is the
+// "backend/server" half of the original roadmap, not another kernel --
+// a genuinely different target, not just a faster way to build the same
+// one.
+//
+// Honest v1.x scope for this first slice (named gaps, not silent ones):
+//   - Functions, structs, if/elif/else, while, for-in-range, return,
+//     int/float/bool/str, borrows (&T / &mut T, same scope as
+//     codegen_c.rs: field access through a BORROWED PARAMETER works,
+//     field access through a locally `let`-bound borrow does not --
+//     matching, not improving on, the C backend's existing limit).
+//   - `print` (via real libc printf) and `abs` (manual select, no libm
+//     dependency needed for something this simple).
+//   - NOT YET: arrays, string concatenation (`+`/`+=` on str), `len()`,
+//     `read_file`/`write_file`, `raw_write`/`unsafe` (meaningless here --
+//     there's no MMIO on a normal userspace process). Every one of these
+//     is REJECTED with a clear, named error at codegen time rather than
+//     silently miscompiled or silently dropped -- same "fail loud, name
+//     the gap" convention as every other backend in this project.
+//   - Global `static`/`const` items ARE supported (straightforward LLVM
+//     global variables).
+//   - Real short-circuit `&&`/`||` (via actual branching + a phi, not a
+//     simple bitwise and/or) -- deliberately NOT simpler-than-necessary
+//     here, since C's `&&`/`||` (what codegen_c.rs emits) really does
+//     short-circuit, and backends silently disagreeing on an operator's
+//     semantics is exactly the kind of gap this project's "backends must
+//     agree" discipline exists to catch BEFORE it ships, not after.
+
+use crate::ast::*;
+use inkwell::builder::Builder;
+use inkwell::context::Context;
+use inkwell::module::Module;
+use inkwell::targets::{CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine};
+use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, StructType};
+use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, FunctionValue, PointerValue};
+use inkwell::{AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel};
+use std::collections::HashMap;
+use std::path::Path;
+
+struct FnCtx<'ctx> {
+    function: FunctionValue<'ctx>,
+    vars: HashMap<String, PointerValue<'ctx>>,
+    // Kernel-level type strings ("int"/"float"/"str"/"bool"/"StructName"/
+    // "&StructName"), the exact same role as codegen_c.rs's var_types --
+    // deliberately NOT LLVM types, since field-type lookup, print
+    // dispatch, etc. all need to reason about Kernel's own type space.
+    var_types: HashMap<String, String>,
+    // True only for a function PARAMETER declared `&T`/`&mut T` -- i.e.
+    // its alloca holds a POINTER VALUE rather than the value directly.
+    // Scope matches codegen_c.rs's is_ptr/accessor() exactly: a locally
+    // `let`-bound borrow (`let r = &origin`) is never entered here, so
+    // field access through it isn't supported, same named limit as the
+    // C backend, not a new one.
+    is_ptr: HashMap<String, bool>,
+}
+
+pub struct LlvmCodegen<'ctx> {
+    context: &'ctx Context,
+    module: Module<'ctx>,
+    builder: Builder<'ctx>,
+    structs: std::collections::HashSet<String>,
+    struct_fields: HashMap<String, Vec<(String, String)>>, // ordered, for GEP index lookup
+    struct_types: HashMap<String, StructType<'ctx>>,
+    functions: HashMap<String, FnDecl>,
+    printf_fn: FunctionValue<'ctx>,
+    // Top-level `static`/`const` items (includes desugared enum variants --
+    // see parser.rs's parse_enum_desugared) are plain LLVM globals, not
+    // locals -- this is their Kernel type, the global-scope twin of
+    // FnCtx::var_types, consulted wherever a local lookup misses (see
+    // var_addr/var_kernel_type below).
+    global_types: HashMap<String, String>,
+}
+
+impl<'ctx> LlvmCodegen<'ctx> {
+    fn new(context: &'ctx Context, module_name: &str) -> Self {
+        let module = context.create_module(module_name);
+        let builder = context.create_builder();
+        let ptr_ty = context.ptr_type(AddressSpace::default());
+        let printf_ty = context.i32_type().fn_type(&[ptr_ty.into()], true);
+        let printf_fn = module.add_function("printf", printf_ty, None);
+        LlvmCodegen {
+            context,
+            module,
+            builder,
+            structs: std::collections::HashSet::new(),
+            struct_fields: HashMap::new(),
+            struct_types: HashMap::new(),
+            functions: HashMap::new(),
+            printf_fn,
+            global_types: HashMap::new(),
+        }
+    }
+
+    fn ptr_type(&self) -> inkwell::types::PointerType<'ctx> {
+        self.context.ptr_type(AddressSpace::default())
+    }
+
+    // Resolves an identifier's storage address, checking locals (params/
+    // `let`s) first, then falling back to a module-level `static`/`const`
+    // global (see global_types' doc comment) -- the single place that
+    // fallback happens, so every caller (gen_expr/gen_addr/
+    // struct_base_ptr) agrees on it instead of three separate ad hoc
+    // lookups silently drifting apart.
+    fn var_addr(&self, name: &str, ctx: &FnCtx<'ctx>) -> PointerValue<'ctx> {
+        if let Some(addr) = ctx.vars.get(name) {
+            return *addr;
+        }
+        self.module
+            .get_global(name)
+            .unwrap_or_else(|| panic!("Kernel LLVM codegen: unknown variable `{}`", name))
+            .as_pointer_value()
+    }
+
+    fn var_kernel_type(&self, name: &str, ctx: &FnCtx<'ctx>) -> String {
+        ctx.var_types
+            .get(name)
+            .or_else(|| self.global_types.get(name))
+            .cloned()
+            .unwrap_or_else(|| "int".to_string())
+    }
+
+    // Kernel type string -> LLVM type. Arrays are a named, explicit gap
+    // (see this module's doc comment) -- panics rather than guessing.
+    fn llvm_type(&self, ty: &str) -> BasicTypeEnum<'ctx> {
+        let trimmed = ty.trim_start_matches('&').trim();
+        if trimmed.starts_with('[') {
+            panic!(
+                "Kernel LLVM codegen: fixed-size arrays aren't supported in the LLVM backend yet \
+                 (type `{}`) -- use `kernel build` (the C/freestanding backend) for programs that need them",
+                ty
+            );
+        }
+        match trimmed {
+            "int" => self.context.i64_type().into(),
+            "float" => self.context.f64_type().into(),
+            "bool" => self.context.bool_type().into(),
+            "str" => self.ptr_type().into(),
+            other if self.struct_types.contains_key(other) => self.struct_types[other].into(),
+            other => panic!("Kernel LLVM codegen: unknown type `{}`", other),
+        }
+    }
+
+    // A function parameter/return's LLVM type: a borrowed type (&T) is
+    // always a bare pointer, regardless of what it points to.
+    fn llvm_type_for_decl(&self, ty: &str) -> BasicTypeEnum<'ctx> {
+        if ty.trim_start_matches('&').trim() != ty.trim() && ty.starts_with('&') {
+            self.ptr_type().into()
+        } else {
+            self.llvm_type(ty)
+        }
+    }
+
+    fn struct_name_of<'a>(&self, ty: &'a str) -> Option<&'a str> {
+        let trimmed = ty.trim_start_matches('&').trim();
+        if self.structs.contains(trimmed) {
+            Some(trimmed)
+        } else {
+            None
+        }
+    }
+
+    fn field_index(&self, struct_name: &str, field: &str) -> u32 {
+        self.struct_fields[struct_name]
+            .iter()
+            .position(|(n, _)| n == field)
+            .unwrap_or_else(|| panic!("Kernel LLVM codegen: struct `{}` has no field `{}`", struct_name, field)) as u32
+    }
+
+    fn field_kernel_type(&self, struct_name: &str, field: &str) -> String {
+        self.struct_fields[struct_name]
+            .iter()
+            .find(|(n, _)| n == field)
+            .map(|(_, t)| t.clone())
+            .unwrap_or_else(|| panic!("Kernel LLVM codegen: struct `{}` has no field `{}`", struct_name, field))
+    }
+
+    /// Infers an expression's KERNEL type string -- the LLVM-backend twin
+    /// of codegen_c.rs's infer_c_type, same purpose, same fallback
+    /// discipline (falls back to "int" only where inference genuinely has
+    /// no better answer, never silently guessing for a type we actually
+    /// know).
+    fn infer_kernel_type(&self, e: &Expr, ctx: &FnCtx<'ctx>) -> String {
+        match e {
+            Expr::Int(_) => "int".to_string(),
+            Expr::Float(_) => "float".to_string(),
+            Expr::Str(_) => "str".to_string(),
+            Expr::Bool(_) => "bool".to_string(),
+            Expr::Ident(name) => ctx.var_types.get(name).or_else(|| self.global_types.get(name)).cloned().unwrap_or_else(|| "int".to_string()),
+            Expr::Binary(l, BinOp::Add, r) => {
+                let lt = self.infer_kernel_type(l, ctx);
+                let rt = self.infer_kernel_type(r, ctx);
+                if lt == "str" && rt == "str" {
+                    "str".to_string()
+                } else if lt == "float" || rt == "float" {
+                    "float".to_string()
+                } else {
+                    "int".to_string()
+                }
+            }
+            Expr::Binary(l, BinOp::Sub | BinOp::Mul | BinOp::Div, r) => {
+                let lt = self.infer_kernel_type(l, ctx);
+                let rt = self.infer_kernel_type(r, ctx);
+                if lt == "float" || rt == "float" {
+                    "float".to_string()
+                } else {
+                    "int".to_string()
+                }
+            }
+            Expr::Binary(..) => "bool".to_string(),
+            Expr::Unary(UnaryOp::Neg, inner) => self.infer_kernel_type(inner, ctx),
+            Expr::Unary(UnaryOp::Not, _) => "bool".to_string(),
+            Expr::Field(obj, field) => {
+                let obj_ty = self.infer_kernel_type(obj, ctx);
+                self.struct_name_of(&obj_ty)
+                    .map(|s| self.field_kernel_type(s, field))
+                    .unwrap_or_else(|| "int".to_string())
+            }
+            Expr::Borrow(inner, _) => format!("&{}", self.infer_kernel_type(inner, ctx)),
+            Expr::Call { name, args } => {
+                if name == "abs" {
+                    return args.first().map(|a| self.infer_kernel_type(arg_expr(a), ctx)).unwrap_or_else(|| "int".to_string());
+                }
+                if self.structs.contains(name) {
+                    name.clone()
+                } else if let Some(f) = self.functions.get(name) {
+                    f.return_ty.clone().unwrap_or_else(|| "int".to_string())
+                } else {
+                    "int".to_string()
+                }
+            }
+            Expr::ArrayLit(_) | Expr::Index(..) => panic!(
+                "Kernel LLVM codegen: fixed-size arrays aren't supported in the LLVM backend yet -- \
+                 use `kernel build` (the C/freestanding backend) for programs that need them"
+            ),
+            Expr::Range(..) => panic!("Kernel LLVM codegen: a range is only valid as a for-loop iterator"),
+            Expr::Closure { .. } => unreachable!("Kernel LLVM codegen: Expr::Closure should always be erased by lambda_lift.rs before codegen runs"),
+        }
+    }
+
+    fn generate(&mut self, program: &Program) {
+        // Register struct tables first (opaque, so self-/mutually-referencing
+        // field types resolve regardless of declaration order), THEN set
+        // each struct's real body -- the standard two-pass pattern for any
+        // LLVM frontend with named aggregate types.
+        for item in &program.items {
+            if let Item::Struct(s) = item {
+                self.structs.insert(s.name.clone());
+                self.struct_fields.insert(s.name.clone(), s.fields.clone());
+                self.struct_types.insert(s.name.clone(), self.context.opaque_struct_type(&s.name));
+            }
+        }
+        for item in &program.items {
+            if let Item::Struct(s) = item {
+                let field_types: Vec<BasicTypeEnum> = s.fields.iter().map(|(_, t)| self.llvm_type(t)).collect();
+                self.struct_types[&s.name].set_body(&field_types, false);
+            }
+        }
+        for item in &program.items {
+            if let Item::Function(f) = item {
+                self.functions.insert(f.name.clone(), f.clone());
+            }
+        }
+
+        // Globals (static/const) -- plain LLVM global variables. Their
+        // initializers must be constant expressions (int/float/bool/str
+        // literals only in practice -- same subset the checker/interpreter
+        // actually allow at the top level).
+        for item in &program.items {
+            match item {
+                Item::Static { name, ty, value, .. } | Item::Const { name, ty, value, .. } => {
+                    self.global_types.insert(name.clone(), ty.clone());
+                    self.declare_global(name, ty, value);
+                }
+                _ => {}
+            }
+        }
+
+        // Forward declarations, so call order / recursion never matters --
+        // same reasoning as codegen_c.rs's two-pass (declare, then define).
+        for item in &program.items {
+            if let Item::Function(f) = item {
+                self.declare_function(f);
+            }
+        }
+        for item in &program.items {
+            if let Item::Function(f) = item {
+                self.define_function(f);
+            }
+        }
+    }
+
+    fn declare_global(&self, name: &str, ty: &str, value: &Expr) {
+        let llvm_ty = self.llvm_type(ty);
+        let global = self.module.add_global(llvm_ty, None, name);
+        let init: BasicValueEnum = match value {
+            Expr::Int(n) => self.context.i64_type().const_int(*n as u64, true).into(),
+            Expr::Float(x) => self.context.f64_type().const_float(*x).into(),
+            Expr::Bool(b) => self.context.bool_type().const_int(*b as u64, false).into(),
+            Expr::Str(s) => {
+                // Can't use builder.build_global_string_ptr here (it
+                // builds a GEP INSTRUCTION, which needs an active
+                // insertion point -- this runs at module scope, before
+                // any function body exists to position the builder in,
+                // which is exactly what crashed here with "UnsetPosition"
+                // before this fix). Building the constant array global
+                // directly, with no instruction involved, works at any
+                // point and is exactly what Expr::Str needs INSIDE a
+                // function body too, just routed through the builder
+                // there for convenience since a position already exists.
+                let bytes = self.context.const_string(s.as_bytes(), true);
+                let str_global = self.module.add_global(bytes.get_type(), None, &format!("{}_data", name));
+                str_global.set_initializer(&bytes);
+                str_global.set_constant(true);
+                str_global.as_pointer_value().into()
+            }
+            other => panic!(
+                "Kernel LLVM codegen: global `{}`'s initializer must be a literal (int/float/bool/str), found {:?}",
+                name, other
+            ),
+        };
+        global.set_initializer(&init);
+    }
+
+    fn fn_name(&self, f: &FnDecl) -> String {
+        // Unlike codegen_c.rs's `main` -> `kmain` rename (needed because a
+        // freestanding kernel's REAL entry point is boot.s's `_start`,
+        // which calls `kmain` after setting up its own stack), this
+        // backend targets a normal OS process -- Kernel's `main` becomes
+        // the program's real, actual `main`, the one the OS itself calls.
+        f.name.clone()
+    }
+
+    fn declare_function(&self, f: &FnDecl) {
+        let param_types: Vec<BasicMetadataTypeEnum> = f.params.iter().map(|p| self.param_llvm_type(p).into()).collect();
+        let name = self.fn_name(f);
+        if name == "main" {
+            // Real C ABI main: always `i32 main(void)`, regardless of
+            // whether Kernel's own main declares a return type -- see
+            // define_function for how a declared return value becomes the
+            // process's actual exit code.
+            let fn_type = self.context.i32_type().fn_type(&[], false);
+            self.module.add_function("main", fn_type, None);
+            return;
+        }
+        let fn_type = match &f.return_ty {
+            Some(t) => self.llvm_type_for_decl(t).fn_type(&param_types, false),
+            None => self.context.void_type().fn_type(&param_types, false),
+        };
+        self.module.add_function(&name, fn_type, None);
+    }
+
+    fn param_llvm_type(&self, p: &Param) -> BasicTypeEnum<'ctx> {
+        if p.borrowed {
+            self.ptr_type().into()
+        } else {
+            self.llvm_type(&p.ty)
+        }
+    }
+
+    fn define_function(&self, f: &FnDecl) {
+        let name = self.fn_name(f);
+        let function = self.module.get_function(&name).unwrap();
+        let entry = self.context.append_basic_block(function, "entry");
+        self.builder.position_at_end(entry);
+
+        let mut ctx = FnCtx { function, vars: HashMap::new(), var_types: HashMap::new(), is_ptr: HashMap::new() };
+        for (i, p) in f.params.iter().enumerate() {
+            let llvm_param = function.get_nth_param(i as u32).unwrap();
+            let alloca = self.builder.build_alloca(self.param_llvm_type(p), &p.name).unwrap();
+            self.builder.build_store(alloca, llvm_param).unwrap();
+            ctx.vars.insert(p.name.clone(), alloca);
+            ctx.var_types.insert(p.name.clone(), if p.borrowed { format!("&{}", p.ty) } else { p.ty.clone() });
+            ctx.is_ptr.insert(p.name.clone(), p.borrowed);
+        }
+
+        for stmt in &f.body {
+            self.gen_stmt(stmt, &mut ctx);
+        }
+
+        if !self.block_terminated() {
+            // Fell off the end of the body with no explicit `return` --
+            // main gets an implicit exit code of 0 (matching the C `int
+            // main(void) { ...; return 0; }` convention every one of
+            // these Kernel examples implicitly relies on, same as
+            // codegen_c.rs's kmain, which the kernel's boot.s simply never
+            // returns from at all). A non-main void function just
+            // `ret void`s. A non-main function with a DECLARED return
+            // type falling off the end with no `return` is a real
+            // Kernel-level bug the checker should have caught already
+            // (see checker.rs) -- codegen isn't the place to re-diagnose
+            // it, so this intentionally returns a zeroed value rather
+            // than silently miscompiling into undefined IR.
+            if name == "main" {
+                self.builder.build_return(Some(&self.context.i32_type().const_int(0, false))).unwrap();
+            } else {
+                match &f.return_ty {
+                    Some(t) => {
+                        let zero = self.zero_value(t);
+                        self.builder.build_return(Some(&zero)).unwrap();
+                    }
+                    None => {
+                        self.builder.build_return(None).unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    fn zero_value(&self, ty: &str) -> BasicValueEnum<'ctx> {
+        match self.llvm_type(ty) {
+            BasicTypeEnum::IntType(t) => t.const_zero().into(),
+            BasicTypeEnum::FloatType(t) => t.const_zero().into(),
+            BasicTypeEnum::PointerType(t) => t.const_null().into(),
+            BasicTypeEnum::StructType(t) => t.const_zero().into(),
+            other => panic!("Kernel LLVM codegen: no zero value for {:?}", other),
+        }
+    }
+
+    fn block_terminated(&self) -> bool {
+        self.builder.get_insert_block().and_then(|b| b.get_terminator()).is_some()
+    }
+
+    // The ADDRESS of a "place" expression (an ident, or a field chain
+    // rooted in one) -- used for Stmt::Let's target isn't needed (lets
+    // always create a fresh alloca), but IS needed for FieldAssign,
+    // IndexAssign's base (arrays aren't supported yet so N/A), and
+    // Expr::Borrow (`&x` is exactly "the address of x").
+    fn gen_addr(&self, e: &Expr, ctx: &FnCtx<'ctx>) -> PointerValue<'ctx> {
+        match e {
+            Expr::Ident(name) => self.var_addr(name, ctx),
+            Expr::Field(obj, field) => {
+                let obj_ty = self.infer_kernel_type(obj, ctx);
+                let struct_name = self
+                    .struct_name_of(&obj_ty)
+                    .unwrap_or_else(|| panic!("Kernel LLVM codegen: field access on a non-struct type `{}`", obj_ty))
+                    .to_string();
+                let base_ptr = self.struct_base_ptr(obj, ctx);
+                let idx = self.field_index(&struct_name, field);
+                let struct_ty = self.struct_types[&struct_name];
+                self.builder.build_struct_gep(struct_ty, base_ptr, idx, "fieldaddr").unwrap()
+            }
+            Expr::Borrow(inner, _) => self.gen_addr(inner, ctx),
+            other => panic!(
+                "Kernel LLVM codegen: `{:?}` isn't a supported place expression in v1.x (only identifiers \
+                 and field accesses rooted in one)",
+                other
+            ),
+        }
+    }
+
+    // The address of the STRUCT a field-access expression's base refers
+    // to -- handles the is_ptr dereference-vs-direct distinction exactly
+    // like codegen_c.rs's accessor() picks "." vs "->".
+    fn struct_base_ptr(&self, obj: &Expr, ctx: &FnCtx<'ctx>) -> PointerValue<'ctx> {
+        match obj {
+            Expr::Ident(name) => {
+                let addr = self.var_addr(name, ctx);
+                if *ctx.is_ptr.get(name).unwrap_or(&false) {
+                    self.builder.build_load(self.ptr_type(), addr, "deref").unwrap().into_pointer_value()
+                } else {
+                    addr
+                }
+            }
+            Expr::Field(..) => self.gen_addr(obj, ctx),
+            Expr::Borrow(inner, _) => self.gen_addr(inner, ctx),
+            other => panic!("Kernel LLVM codegen: `{:?}` isn't a supported struct base expression in v1.x", other),
+        }
+    }
+
+    fn gen_expr(&self, e: &Expr, ctx: &FnCtx<'ctx>) -> BasicValueEnum<'ctx> {
+        match e {
+            Expr::Int(n) => self.context.i64_type().const_int(*n as u64, true).into(),
+            Expr::Float(x) => self.context.f64_type().const_float(*x).into(),
+            Expr::Bool(b) => self.context.bool_type().const_int(*b as u64, false).into(),
+            Expr::Str(s) => self.builder.build_global_string_ptr(s, "strlit").unwrap().as_pointer_value().into(),
+            Expr::Ident(name) => {
+                let addr = self.var_addr(name, ctx);
+                let kernel_ty = self.var_kernel_type(name, ctx);
+                // A pointer-typed variable (a borrowed PARAMETER, or a
+                // locally `let`-bound borrow like `let r1 = &origin`)
+                // always has a `ptr`-typed alloca -- loading it with any
+                // other LLVM type (e.g. the pointee's struct type) would
+                // read the wrong number of bytes starting at the wrong
+                // place, not just produce the wrong VALUE (a real bug
+                // this exact check exists to prevent, caught by
+                // multi_shared_borrow_ok.kn printing a garbage pointer
+                // bit-pattern instead of 5 before this fix).
+                let llvm_ty = if kernel_ty.starts_with('&') { self.ptr_type().into() } else { self.llvm_type(&kernel_ty) };
+                self.builder.build_load(llvm_ty, addr, name).unwrap()
+            }
+            Expr::Unary(UnaryOp::Neg, inner) => {
+                let v = self.gen_expr(inner, ctx);
+                match v {
+                    BasicValueEnum::IntValue(i) => self.builder.build_int_neg(i, "neg").unwrap().into(),
+                    BasicValueEnum::FloatValue(f) => self.builder.build_float_neg(f, "fneg").unwrap().into(),
+                    _ => panic!("Kernel LLVM codegen: unary `-` on a non-numeric value"),
+                }
+            }
+            Expr::Unary(UnaryOp::Not, inner) => {
+                let v = self.gen_expr(inner, ctx).into_int_value();
+                self.builder.build_not(v, "not").unwrap().into()
+            }
+            Expr::Binary(l, BinOp::And, r) => self.gen_short_circuit(l, r, ctx, true).into(),
+            Expr::Binary(l, BinOp::Or, r) => self.gen_short_circuit(l, r, ctx, false).into(),
+            Expr::Binary(l, BinOp::Add, r)
+                if self.infer_kernel_type(l, ctx) == "str" && self.infer_kernel_type(r, ctx) == "str" =>
+            {
+                panic!(
+                    "Kernel LLVM codegen: string concatenation (`+`) isn't supported in the LLVM backend yet \
+                     -- use `kernel build` (the C backend) or `kernel run` (the interpreter) for programs that need it"
+                );
+            }
+            Expr::Binary(l, op, r) => self.gen_binop(l, *op, r, ctx),
+            Expr::Field(..) => {
+                let obj = match e {
+                    Expr::Field(obj, _) => obj,
+                    _ => unreachable!(),
+                };
+                let field = match e {
+                    Expr::Field(_, f) => f,
+                    _ => unreachable!(),
+                };
+                let addr = self.gen_addr(e, ctx);
+                let obj_ty = self.infer_kernel_type(obj, ctx);
+                let struct_name = self.struct_name_of(&obj_ty).unwrap();
+                let field_ty = self.field_kernel_type(struct_name, field);
+                self.builder.build_load(self.llvm_type(&field_ty), addr, "fieldval").unwrap()
+            }
+            Expr::Borrow(_, _) => self.gen_addr(e, ctx).into(),
+            Expr::Call { name, args } => self.gen_call(name, args, ctx),
+            Expr::ArrayLit(_) | Expr::Index(..) => panic!(
+                "Kernel LLVM codegen: fixed-size arrays aren't supported in the LLVM backend yet -- \
+                 use `kernel build` (the C/freestanding backend) for programs that need them"
+            ),
+            Expr::Range(..) => panic!("Kernel LLVM codegen: a range is only valid as a for-loop iterator"),
+            Expr::Closure { .. } => unreachable!("Kernel LLVM codegen: Expr::Closure should always be erased by lambda_lift.rs before codegen runs"),
+        }
+    }
+
+    fn gen_short_circuit(&self, l: &Expr, r: &Expr, ctx: &FnCtx<'ctx>, is_and: bool) -> inkwell::values::IntValue<'ctx> {
+        // Real branching short-circuit, matching C's `&&`/`||` semantics
+        // exactly (what codegen_c.rs emits) -- see this module's doc
+        // comment for why a simpler eager and/or would be a real,
+        // dangerous cross-backend divergence, not a harmless shortcut.
+        let lhs = self.gen_expr(l, ctx).into_int_value();
+        let entry_bb = self.builder.get_insert_block().unwrap();
+        let rhs_bb = self.context.append_basic_block(ctx.function, if is_and { "and_rhs" } else { "or_rhs" });
+        let merge_bb = self.context.append_basic_block(ctx.function, if is_and { "and_merge" } else { "or_merge" });
+        if is_and {
+            self.builder.build_conditional_branch(lhs, rhs_bb, merge_bb).unwrap();
+        } else {
+            self.builder.build_conditional_branch(lhs, merge_bb, rhs_bb).unwrap();
+        }
+        self.builder.position_at_end(rhs_bb);
+        let rhs = self.gen_expr(r, ctx).into_int_value();
+        let rhs_end_bb = self.builder.get_insert_block().unwrap();
+        self.builder.build_unconditional_branch(merge_bb).unwrap();
+        self.builder.position_at_end(merge_bb);
+        let phi = self.builder.build_phi(self.context.bool_type(), if is_and { "and_result" } else { "or_result" }).unwrap();
+        phi.add_incoming(&[(&lhs, entry_bb), (&rhs, rhs_end_bb)]);
+        phi.as_basic_value().into_int_value()
+    }
+
+    fn gen_binop(&self, l: &Expr, op: BinOp, r: &Expr, ctx: &FnCtx<'ctx>) -> BasicValueEnum<'ctx> {
+        let lv = self.gen_expr(l, ctx);
+        let rv = self.gen_expr(r, ctx);
+        let is_float = matches!(lv, BasicValueEnum::FloatValue(_)) || matches!(rv, BasicValueEnum::FloatValue(_));
+        if is_float {
+            let lf = self.to_float(lv);
+            let rf = self.to_float(rv);
+            match op {
+                BinOp::Add => self.builder.build_float_add(lf, rf, "fadd").unwrap().into(),
+                BinOp::Sub => self.builder.build_float_sub(lf, rf, "fsub").unwrap().into(),
+                BinOp::Mul => self.builder.build_float_mul(lf, rf, "fmul").unwrap().into(),
+                BinOp::Div => self.builder.build_float_div(lf, rf, "fdiv").unwrap().into(),
+                BinOp::Mod => self.builder.build_float_rem(lf, rf, "frem").unwrap().into(),
+                BinOp::Eq => self.builder.build_float_compare(FloatPredicate::OEQ, lf, rf, "feq").unwrap().into(),
+                BinOp::NotEq => self.builder.build_float_compare(FloatPredicate::ONE, lf, rf, "fne").unwrap().into(),
+                BinOp::Lt => self.builder.build_float_compare(FloatPredicate::OLT, lf, rf, "flt").unwrap().into(),
+                BinOp::Gt => self.builder.build_float_compare(FloatPredicate::OGT, lf, rf, "fgt").unwrap().into(),
+                BinOp::LtEq => self.builder.build_float_compare(FloatPredicate::OLE, lf, rf, "fle").unwrap().into(),
+                BinOp::GtEq => self.builder.build_float_compare(FloatPredicate::OGE, lf, rf, "fge").unwrap().into(),
+                BinOp::And | BinOp::Or => unreachable!("handled by gen_short_circuit before reaching gen_binop"),
+            }
+        } else {
+            let li = lv.into_int_value();
+            let ri = rv.into_int_value();
+            match op {
+                BinOp::Add => self.builder.build_int_add(li, ri, "add").unwrap().into(),
+                BinOp::Sub => self.builder.build_int_sub(li, ri, "sub").unwrap().into(),
+                BinOp::Mul => self.builder.build_int_mul(li, ri, "mul").unwrap().into(),
+                BinOp::Div => self.builder.build_int_signed_div(li, ri, "div").unwrap().into(),
+                BinOp::Mod => self.builder.build_int_signed_rem(li, ri, "rem").unwrap().into(),
+                BinOp::Eq => self.builder.build_int_compare(IntPredicate::EQ, li, ri, "eq").unwrap().into(),
+                BinOp::NotEq => self.builder.build_int_compare(IntPredicate::NE, li, ri, "ne").unwrap().into(),
+                BinOp::Lt => self.builder.build_int_compare(IntPredicate::SLT, li, ri, "lt").unwrap().into(),
+                BinOp::Gt => self.builder.build_int_compare(IntPredicate::SGT, li, ri, "gt").unwrap().into(),
+                BinOp::LtEq => self.builder.build_int_compare(IntPredicate::SLE, li, ri, "le").unwrap().into(),
+                BinOp::GtEq => self.builder.build_int_compare(IntPredicate::SGE, li, ri, "ge").unwrap().into(),
+                BinOp::And | BinOp::Or => unreachable!("handled by gen_short_circuit before reaching gen_binop"),
+            }
+        }
+    }
+
+    fn to_float(&self, v: BasicValueEnum<'ctx>) -> inkwell::values::FloatValue<'ctx> {
+        match v {
+            BasicValueEnum::FloatValue(f) => f,
+            BasicValueEnum::IntValue(i) => self.builder.build_signed_int_to_float(i, self.context.f64_type(), "itof").unwrap(),
+            _ => panic!("Kernel LLVM codegen: expected a numeric value"),
+        }
+    }
+
+    fn gen_call(&self, name: &str, args: &[CallArg], ctx: &FnCtx<'ctx>) -> BasicValueEnum<'ctx> {
+        match name {
+            "abs" => {
+                let e = arg_expr(args.first().unwrap_or_else(|| panic!("Kernel LLVM codegen: abs() requires exactly one argument")));
+                let v = self.gen_expr(e, ctx);
+                match v {
+                    BasicValueEnum::FloatValue(f) => {
+                        let zero = self.context.f64_type().const_zero();
+                        let is_neg = self.builder.build_float_compare(FloatPredicate::OLT, f, zero, "isneg").unwrap();
+                        let negated = self.builder.build_float_neg(f, "negf").unwrap();
+                        self.builder.build_select(is_neg, negated, f, "fabs").unwrap()
+                    }
+                    BasicValueEnum::IntValue(i) => {
+                        let zero = self.context.i64_type().const_zero();
+                        let is_neg = self.builder.build_int_compare(IntPredicate::SLT, i, zero, "isneg").unwrap();
+                        let negated = self.builder.build_int_neg(i, "negi").unwrap();
+                        self.builder.build_select(is_neg, negated, i, "abs").unwrap()
+                    }
+                    _ => panic!("Kernel LLVM codegen: abs() on a non-numeric value"),
+                }
+            }
+            "len" | "read_file" | "write_file" | "raw_write" => panic!(
+                "Kernel LLVM codegen: `{}` isn't supported in the LLVM backend yet -- {}",
+                name,
+                match name {
+                    "len" => "arrays/strings' len() needs the array/string support this backend doesn't have yet",
+                    "read_file" | "write_file" => "file I/O is interpreter-only (dev-mode); `kernel run` is the right tool for it",
+                    "raw_write" => "there's no MMIO on a normal userspace process -- this only makes sense for the freestanding C backend",
+                    _ => unreachable!(),
+                }
+            ),
+            _ if self.structs.contains(name) => {
+                let struct_ty = self.struct_types[name];
+                let fields = &self.struct_fields[name];
+                let mut agg = struct_ty.get_undef();
+                for a in args {
+                    if let CallArg::Named(fname, e) = a {
+                        let idx = fields.iter().position(|(n, _)| n == fname).unwrap_or_else(|| {
+                            panic!("Kernel LLVM codegen: struct `{}` has no field `{}`", name, fname)
+                        }) as u32;
+                        let val = self.gen_expr(e, ctx);
+                        agg = self.builder.build_insert_value(agg, val, idx, "structinit").unwrap().into_struct_value();
+                    }
+                }
+                agg.into()
+            }
+            _ => {
+                let callee = self.module.get_function(name).unwrap();
+                // No special-casing by the callee's declared borrowedness
+                // here -- matching codegen_c.rs's call_arg exactly: the
+                // ARGUMENT EXPRESSION itself already produces the right
+                // pointer value when the Kernel source calls for one
+                // (`peek(&origin)` -> Expr::Borrow computes the address
+                // directly; `peek(r1)` where `r1: &Point` -> Expr::Ident
+                // loads r1's own (pointer-typed) storage, which already
+                // holds that same address) -- gen_expr handles both
+                // correctly on its own. Using gen_addr here instead (an
+                // earlier version of this function did) is a real, subtle
+                // bug: for a plain Ident argument it would take the
+                // address of the ARGUMENT VARIABLE's own storage slot
+                // instead of the pointer VALUE already stored there.
+                let call_args: Vec<BasicMetadataValueEnum> = args.iter().map(|a| self.gen_expr(arg_expr(a), ctx).into()).collect();
+                let result = self.builder.build_call(callee, &call_args, "call").unwrap();
+                result.try_as_basic_value().basic().unwrap_or_else(|| self.context.i64_type().const_zero().into())
+            }
+        }
+    }
+
+    fn gen_stmt(&self, s: &Stmt, ctx: &mut FnCtx<'ctx>) {
+        match s {
+            Stmt::Let { name, value, .. } => {
+                let kernel_ty = self.infer_kernel_type(value, ctx);
+                let val = self.gen_expr(value, ctx);
+                let llvm_ty = if matches!(value, Expr::Borrow(..)) { self.ptr_type().into() } else { self.llvm_type(&kernel_ty) };
+                let alloca = self.builder.build_alloca(llvm_ty, name).unwrap();
+                self.builder.build_store(alloca, val).unwrap();
+                ctx.vars.insert(name.clone(), alloca);
+                ctx.var_types.insert(name.clone(), kernel_ty);
+                ctx.is_ptr.insert(name.clone(), false); // see FnCtx::is_ptr's doc comment: only params track this
+            }
+            Stmt::Assign { name, op, value } => {
+                let addr = self.var_addr(name, ctx);
+                let kernel_ty = self.var_kernel_type(name, ctx);
+                let llvm_ty = self.llvm_type(&kernel_ty);
+                let new_val = match op {
+                    AssignOp::Set => self.gen_expr(value, ctx),
+                    AssignOp::Add | AssignOp::Sub => {
+                        let cur = self.builder.build_load(llvm_ty, addr, "cur").unwrap();
+                        let rhs = self.gen_expr(value, ctx);
+                        match (cur, rhs) {
+                            (BasicValueEnum::IntValue(a), BasicValueEnum::IntValue(b)) => {
+                                if *op == AssignOp::Add { self.builder.build_int_add(a, b, "add").unwrap().into() }
+                                else { self.builder.build_int_sub(a, b, "sub").unwrap().into() }
+                            }
+                            _ => {
+                                let a = self.to_float(cur);
+                                let b = self.to_float(rhs);
+                                if *op == AssignOp::Add { self.builder.build_float_add(a, b, "fadd").unwrap().into() }
+                                else { self.builder.build_float_sub(a, b, "fsub").unwrap().into() }
+                            }
+                        }
+                    }
+                };
+                self.builder.build_store(addr, new_val).unwrap();
+            }
+            Stmt::FieldAssign { object, field, value } => {
+                let addr = self.gen_addr(&Expr::Field(Box::new(object.clone()), field.clone()), ctx);
+                let val = self.gen_expr(value, ctx);
+                self.builder.build_store(addr, val).unwrap();
+            }
+            Stmt::IndexAssign { .. } => panic!(
+                "Kernel LLVM codegen: fixed-size arrays aren't supported in the LLVM backend yet -- \
+                 use `kernel build` (the C/freestanding backend) for programs that need them"
+            ),
+            Stmt::If { arms, else_body } => self.gen_if(arms, else_body, ctx),
+            Stmt::While { cond, body } => self.gen_while(cond, body, ctx),
+            Stmt::For { var, iter, body } => self.gen_for(var, iter, body, ctx),
+            Stmt::Return(expr) => {
+                match expr {
+                    Some(e) => {
+                        let val = self.gen_expr(e, ctx);
+                        if ctx.function.get_name().to_str().unwrap() == "main" {
+                            // Kernel main's declared return value becomes
+                            // the process's real exit code -- truncate to
+                            // i32 since that's the real C ABI's `main`
+                            // return width (the OS masks it to one byte
+                            // regardless, same as any native `exit()`).
+                            let as_i64 = val.into_int_value();
+                            let as_i32 = self.builder.build_int_truncate(as_i64, self.context.i32_type(), "exitcode").unwrap();
+                            self.builder.build_return(Some(&as_i32)).unwrap();
+                        } else {
+                            self.builder.build_return(Some(&val)).unwrap();
+                        }
+                    }
+                    None => {
+                        if ctx.function.get_name().to_str().unwrap() == "main" {
+                            self.builder.build_return(Some(&self.context.i32_type().const_int(0, false))).unwrap();
+                        } else {
+                            self.builder.build_return(None).unwrap();
+                        }
+                    }
+                }
+            }
+            Stmt::Unsafe(_) => panic!(
+                "Kernel LLVM codegen: `unsafe` blocks (raw_write/MMIO) aren't supported in the LLVM backend -- \
+                 there's no MMIO on a normal userspace process; use `kernel build` (the C/freestanding backend) instead"
+            ),
+            Stmt::Expr(e) => {
+                if let Expr::Call { name, args } = e {
+                    if name == "print" {
+                        self.gen_print(args, ctx);
+                        return;
+                    }
+                }
+                self.gen_expr(e, ctx);
+            }
+        }
+    }
+
+    fn gen_print(&self, args: &[CallArg], ctx: &FnCtx<'ctx>) {
+        let mut fmt = String::new();
+        let mut vals: Vec<BasicValueEnum<'ctx>> = Vec::new();
+        for (i, a) in args.iter().enumerate() {
+            if i > 0 {
+                fmt.push(' ');
+            }
+            let e = arg_expr(a);
+            let ty = self.infer_kernel_type(e, ctx);
+            match ty.as_str() {
+                "str" => {
+                    fmt.push_str("%s");
+                    vals.push(self.gen_expr(e, ctx));
+                }
+                "float" => {
+                    fmt.push_str("%.2f");
+                    vals.push(self.gen_expr(e, ctx));
+                }
+                "bool" => {
+                    fmt.push_str("%s");
+                    let v = self.gen_expr(e, ctx).into_int_value();
+                    let true_s = self.builder.build_global_string_ptr("true", "truestr").unwrap().as_pointer_value();
+                    let false_s = self.builder.build_global_string_ptr("false", "falsestr").unwrap().as_pointer_value();
+                    let selected = self.builder.build_select(v, true_s, false_s, "boolstr").unwrap();
+                    vals.push(selected);
+                }
+                _ => {
+                    fmt.push_str("%ld");
+                    vals.push(self.gen_expr(e, ctx));
+                }
+            }
+        }
+        fmt.push('\n');
+        let fmt_ptr = self.builder.build_global_string_ptr(&fmt, "fmt").unwrap().as_pointer_value();
+        let mut call_args: Vec<BasicMetadataValueEnum> = vec![fmt_ptr.into()];
+        call_args.extend(vals.into_iter().map(BasicMetadataValueEnum::from));
+        self.builder.build_call(self.printf_fn, &call_args, "printf_call").unwrap();
+    }
+
+    fn gen_if(&self, arms: &[(Expr, Vec<Stmt>)], else_body: &Option<Vec<Stmt>>, ctx: &mut FnCtx<'ctx>) {
+        let merge_bb = self.context.append_basic_block(ctx.function, "if_merge");
+        self.gen_if_chain(arms, else_body, 0, merge_bb, ctx);
+        self.builder.position_at_end(merge_bb);
+    }
+
+    fn gen_if_chain(&self, arms: &[(Expr, Vec<Stmt>)], else_body: &Option<Vec<Stmt>>, i: usize, merge_bb: inkwell::basic_block::BasicBlock<'ctx>, ctx: &mut FnCtx<'ctx>) {
+        if i >= arms.len() {
+            if let Some(body) = else_body {
+                let else_bb = self.context.append_basic_block(ctx.function, "else_body");
+                self.builder.build_unconditional_branch(else_bb).unwrap();
+                self.builder.position_at_end(else_bb);
+                let mut branch_ctx = FnCtx { function: ctx.function, vars: ctx.vars.clone(), var_types: ctx.var_types.clone(), is_ptr: ctx.is_ptr.clone() };
+                for st in body {
+                    self.gen_stmt(st, &mut branch_ctx);
+                }
+                if !self.block_terminated() {
+                    self.builder.build_unconditional_branch(merge_bb).unwrap();
+                }
+            } else {
+                self.builder.build_unconditional_branch(merge_bb).unwrap();
+            }
+            return;
+        }
+        let (cond, body) = &arms[i];
+        let cond_val = self.gen_expr(cond, ctx).into_int_value();
+        let then_bb = self.context.append_basic_block(ctx.function, "if_then");
+        let next_bb = self.context.append_basic_block(ctx.function, "if_next");
+        self.builder.build_conditional_branch(cond_val, then_bb, next_bb).unwrap();
+
+        self.builder.position_at_end(then_bb);
+        let mut branch_ctx = FnCtx { function: ctx.function, vars: ctx.vars.clone(), var_types: ctx.var_types.clone(), is_ptr: ctx.is_ptr.clone() };
+        for st in body {
+            self.gen_stmt(st, &mut branch_ctx);
+        }
+        if !self.block_terminated() {
+            self.builder.build_unconditional_branch(merge_bb).unwrap();
+        }
+
+        self.builder.position_at_end(next_bb);
+        self.gen_if_chain(arms, else_body, i + 1, merge_bb, ctx);
+    }
+
+    fn gen_while(&self, cond: &Expr, body: &[Stmt], ctx: &mut FnCtx<'ctx>) {
+        let header_bb = self.context.append_basic_block(ctx.function, "while_header");
+        let body_bb = self.context.append_basic_block(ctx.function, "while_body");
+        let after_bb = self.context.append_basic_block(ctx.function, "while_after");
+        self.builder.build_unconditional_branch(header_bb).unwrap();
+
+        self.builder.position_at_end(header_bb);
+        let cond_val = self.gen_expr(cond, ctx).into_int_value();
+        self.builder.build_conditional_branch(cond_val, body_bb, after_bb).unwrap();
+
+        self.builder.position_at_end(body_bb);
+        for st in body {
+            self.gen_stmt(st, ctx);
+        }
+        if !self.block_terminated() {
+            self.builder.build_unconditional_branch(header_bb).unwrap();
+        }
+
+        self.builder.position_at_end(after_bb);
+    }
+
+    fn gen_for(&self, var: &str, iter: &Expr, body: &[Stmt], ctx: &mut FnCtx<'ctx>) {
+        let (lo, hi) = match iter {
+            Expr::Range(lo, hi) => (lo, hi),
+            _ => panic!("Kernel LLVM codegen: for-loop requires a range (a..b)"),
+        };
+        let lo_val = self.gen_expr(lo, ctx).into_int_value();
+        let hi_val = self.gen_expr(hi, ctx).into_int_value();
+        let alloca = self.builder.build_alloca(self.context.i64_type(), var).unwrap();
+        self.builder.build_store(alloca, lo_val).unwrap();
+
+        let header_bb = self.context.append_basic_block(ctx.function, "for_header");
+        let body_bb = self.context.append_basic_block(ctx.function, "for_body");
+        let after_bb = self.context.append_basic_block(ctx.function, "for_after");
+        self.builder.build_unconditional_branch(header_bb).unwrap();
+
+        self.builder.position_at_end(header_bb);
+        let cur = self.builder.build_load(self.context.i64_type(), alloca, var).unwrap().into_int_value();
+        let cond = self.builder.build_int_compare(IntPredicate::SLT, cur, hi_val, "forcond").unwrap();
+        self.builder.build_conditional_branch(cond, body_bb, after_bb).unwrap();
+
+        self.builder.position_at_end(body_bb);
+        let mut loop_ctx = FnCtx { function: ctx.function, vars: ctx.vars.clone(), var_types: ctx.var_types.clone(), is_ptr: ctx.is_ptr.clone() };
+        loop_ctx.vars.insert(var.to_string(), alloca);
+        loop_ctx.var_types.insert(var.to_string(), "int".to_string());
+        for st in body {
+            self.gen_stmt(st, &mut loop_ctx);
+        }
+        if !self.block_terminated() {
+            let cur2 = self.builder.build_load(self.context.i64_type(), alloca, var).unwrap().into_int_value();
+            let next = self.builder.build_int_add(cur2, self.context.i64_type().const_int(1, false), "forinc").unwrap();
+            self.builder.build_store(alloca, next).unwrap();
+            self.builder.build_unconditional_branch(header_bb).unwrap();
+        }
+
+        self.builder.position_at_end(after_bb);
+    }
+}
+
+fn arg_expr(a: &CallArg) -> &Expr {
+    match a {
+        CallArg::Positional(e) | CallArg::Named(_, e) => e,
+    }
+}
+
+/// Compiles `program` straight to a native object file at `out_obj_path`
+/// for the HOST's own target triple (no cross-compilation support in
+/// v1.x -- a named, deliberately out-of-scope-for-now gap: cross-
+/// targeting is a real, separate feature, not a side effect of "just
+/// works" the way it might be for an interpreter).
+pub fn compile_to_object(program: &Program, out_obj_path: &Path) {
+    Target::initialize_native(&InitializationConfig::default())
+        .unwrap_or_else(|e| panic!("Kernel LLVM codegen: failed to initialize the native LLVM target: {}", e));
+
+    let context = Context::create();
+    let mut codegen = LlvmCodegen::new(&context, "kernel_module");
+    codegen.generate(program);
+
+    if let Err(e) = codegen.module.verify() {
+        panic!(
+            "Kernel LLVM codegen: the generated LLVM module failed verification -- this is a real \
+             codegen bug (not a Kernel-level error in the input program):\n{}",
+            e.to_string()
+        );
+    }
+
+    let triple = TargetMachine::get_default_triple();
+    let target = Target::from_triple(&triple).unwrap_or_else(|e| panic!("Kernel LLVM codegen: no LLVM target for {}: {}", triple, e));
+    let target_machine = target
+        .create_target_machine(
+            &triple,
+            TargetMachine::get_host_cpu_name().to_str().unwrap_or("generic"),
+            TargetMachine::get_host_cpu_features().to_str().unwrap_or(""),
+            OptimizationLevel::Default,
+            RelocMode::PIC,
+            CodeModel::Default,
+        )
+        .unwrap_or_else(|| panic!("Kernel LLVM codegen: could not create a target machine for {}", triple));
+
+    target_machine
+        .write_to_file(&codegen.module, FileType::Object, out_obj_path)
+        .unwrap_or_else(|e| panic!("Kernel LLVM codegen: failed writing the object file: {}", e));
+}

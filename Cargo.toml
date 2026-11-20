@@ -4,3 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# First external dependency this project has ever taken on (see ARD-004 --
+# everything else, lexer/parser/checker/interpreter/C-codegen/JSON-for-the-
+# LSP, is hand-rolled). LLVM itself is the one piece genuinely not worth
+# re-implementing: codegen_llvm.rs (v2's real native backend, see RFC-003)
+# needs a mature, battle-tested instruction-selection/register-allocation/
+# optimization pipeline, which is LLVM's actual reason to exist -- hand-
+# rolling that would be reinventing a multi-decade compiler backend, not
+# "proving the pipeline" the way the rest of this project does.
+# Requires LLVM 18 dev packages installed (llvm-18-dev, libpolly-18-dev,
+# libzstd-dev on Debian/Ubuntu) -- llvm-config-18 on PATH is enough, no
+# env var needed (confirmed empirically in this environment).
+inkwell = { version = "0.11", features = ["llvm18-1"] }

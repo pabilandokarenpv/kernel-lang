@@ -18,7 +18,7 @@ This document explains everything about Kernel: what it is, why it exists, every
 8. [What's Implemented vs. What's Deliberately Deferred (v1 Scope)](#8-whats-implemented-vs-whats-deliberately-deferred-v1-scope)
 9. [The Full Tech Stack](#9-the-full-tech-stack)
 10. [Real Bugs Found and Fixed (Engineering Evidence, Not Claims)](#10-real-bugs-found-and-fixed-engineering-evidence-not-claims)
-11. [How This Compares to Rust, Python, Go, and C](#11-how-this-compares-to-rust-python-go-and-c)
+11. [How This Compares to Rust, Python, Go, C, and Zig](#11-how-this-compares-to-rust-python-go-c-and-zig)
 12. [The Long-Term Roadmap](#12-the-long-term-roadmap)
 13. [Where Everything Lives (Repo Map)](#13-where-everything-lives-repo-map)
 14. [Honest Limitations](#14-honest-limitations)
@@ -96,6 +96,15 @@ There's also a second, concrete reason Kernel exists: it's the training-data gen
 | **QEMU** | A free, open-source machine emulator — it simulates real PC hardware in software, letting you "boot" an operating system image without needing physical hardware. | How Kernel's compiled binaries are actually verified to boot and run correctly — `qemu-system-i386 -kernel out.bin`. |
 | **VGA text mode** | A classic PC display mode where the screen is controlled by writing character/color byte pairs directly into a fixed memory region, without any graphics driver. | What Kernel's `kernel_runtime/runtime.c` uses to actually display output from a booted binary. |
 | **Linker script** | A configuration file telling the linker (the tool that combines compiled code into a final binary) exactly how to lay out the final binary in memory — which section goes at which address. | `kernel_runtime/link.ld` — controls exactly where in memory Kernel's compiled binary expects to be loaded. |
+| **Assembler** | A tool that translates human-readable assembly instructions (the most direct text representation of raw CPU instructions) into the actual machine code bytes a processor executes. | GNU `as`, used to turn `kernel_runtime/boot.s` into object code. |
+| **Linker** | A tool that combines multiple separately-compiled pieces of object code (and resolves references between them) into one final executable or binary image. | GNU `ld`, the final step producing `out.bin`. |
+| **Entry point** | The exact first instruction a program's execution begins at — for a normal application this is usually hidden inside startup library code, but for a freestanding binary it has to be defined explicitly. | `_start`, defined in `kernel_runtime/boot.s` — the literal first instruction that runs after QEMU/a bootloader hands over control. |
+| **`.text` / `.rodata` / `.data` / `.bss` (binary sections)** | The standard named regions a compiled binary is divided into: `.text` holds actual executable instructions, `.rodata` holds read-only constants (like string literals), `.data` holds initialized mutable global variables, `.bss` holds *uninitialized* global/static variables (reserved space, zero-filled at load time, not actually stored in the file). | `kernel_runtime/link.ld` explicitly lays these four sections out in memory, in this exact order, starting at a fixed address. |
+| **Load address** | The specific memory address a binary is built to expect it will be placed at when loaded — code that assumes a wrong load address will crash immediately or behave unpredictably. | Kernel's binaries are linked to load at `0x100000` (1 MiB) — a conventional, safe starting address for freestanding x86 kernels, chosen to avoid the lowest megabyte of memory that's reserved/used by BIOS-era hardware structures. |
+| **Protected mode** | An x86 CPU operating mode (as opposed to the older, more limited "real mode") that provides memory protection, 32-bit addressing, and the features a real operating system needs. | QEMU (via the `-kernel` flag, following Multiboot) loads Kernel's binaries directly into 32-bit protected mode — no need for Kernel's own boot code to perform the real-mode-to-protected-mode transition itself. |
+| **Volatile (in C)** | A keyword telling the compiler "never optimize away or reorder reads/writes to this memory location" — necessary when a memory address has side effects outside normal program logic (like hardware registers) that the compiler can't know about. | `kernel_runtime/runtime.c` declares the VGA buffer pointer `volatile` — without it, an aggressive compiler could theoretically decide a repeated write to "the same address" is redundant and skip it, which would silently break on-screen output. |
+| **Port I/O (`outb`)** | On x86, a separate addressing space (distinct from regular memory) used to communicate with certain hardware devices via dedicated CPU instructions, rather than reading/writing normal memory addresses. | `runtime.c`'s `outb()` function uses this to talk to the VGA hardware's cursor-control registers directly (see [Section 7](#7-compiling-to-a-real-bootable-binary)). |
+| **Magic number / checksum (Multiboot)** | A specific, fixed numeric value a boot loader checks for at a known location to confirm "this binary really is formatted the way I expect" before trying to load it — the checksum is a second value mathematically guaranteeing the magic number wasn't corrupted by transmission/storage errors. | Kernel's `boot.s` writes the exact Multiboot magic number `0x1BADB002` and a matching checksum into the binary — if either is wrong, no Multiboot-compliant loader (including QEMU) will accept the binary at all. |
 
 ---
 
@@ -207,6 +216,132 @@ flowchart LR
 
 **Walkthrough**: this is Kernel's actual grammar tree — every real `.kn` program is built entirely out of these pieces, nothing else. A `Program` is just a list of functions, structs, and enums; a function's body is a list of statements; and the statement list is exactly the nine kinds shown here, no more, in v1. The `unsafe block` node is colored differently on purpose — it's the single statement type that behaves differently from every other one: it's the only place the checker *relaxes* its rules rather than enforcing them, which is exactly why it has to be visually and syntactically distinct rather than an ordinary statement. Notice "generics," "traits," "pattern matching," and "closures" don't appear anywhere in this diagram — not because they're unplanned, but because (per [Section 8](#8-whats-implemented-vs-whats-deliberately-deferred-v1-scope)) they're specified in the grammar document for future versions but genuinely not implemented in v1's parser yet.
 
+### 4.1 A Complete Worked Example — Tracing `hello.kn` Through Every Stage
+
+Everything below is real, captured output from actually running the compiler against `examples/hello.kn` — not a hypothetical illustration.
+
+**Step 1 — lexing.** `kernel tokens examples/hello.kn` reports **108 tokens produced** for that ~15-line file. The first portion of the real token stream:
+
+```
+Fn
+Ident("add")
+LParen
+Ident("a")
+Colon
+Ident("int")
+Comma
+Ident("b")
+Colon
+Ident("int")
+RParen
+Arrow
+Ident("int")
+Colon
+Newline
+Indent
+Return
+Ident("a")
+Plus
+Ident("b")
+Newline
+Dedent
+```
+
+Notice `Indent` appears right after the `fn add(...) -> int:` line's `Newline`, and `Dedent` appears right before the next `fn classify(...)` begins — these two tokens are *synthesized* by the lexer, they don't correspond to any single character in the source; they're how indentation changes become first-class grammatical signals the parser can react to, instead of raw whitespace the parser would otherwise have to re-interpret itself.
+
+```mermaid
+flowchart TB
+    START["new line begins"] --> MEASURE["measure leading whitespace width"]
+    MEASURE --> CMP{"compare to top of<br/>the indent stack"}
+    CMP -->|"wider than top"| PUSH["push new width onto the stack,<br/>emit one Indent token"]
+    CMP -->|"equal to top"| SAME["emit Newline only,<br/>no Indent/Dedent"]
+    CMP -->|"narrower than top"| POP["pop the stack,<br/>emit one Dedent token"]
+    POP --> CMP
+    PUSH --> NEXT["continue lexing the line's tokens"]
+    SAME --> NEXT
+```
+
+**Walkthrough**: this is the actual algorithm `lexer.rs` runs on every new line — a single stack of "indentation widths seen so far," starting with just `0` on it. Three things can happen each time a new line's indentation is measured against whatever's currently on top of that stack: it's deeper (push the new width, emit one `Indent`), it's the same (nothing structural changed, just a normal new statement), or it's shallower (pop the stack and emit a `Dedent` — and critically, this pop-and-check loops, because dedenting from a deeply nested block back out to the top level might need to emit *several* `Dedent` tokens in a row, one for each level the stack unwinds through). This is the same fundamental approach the Python Language Reference describes for Python's own lexer (cited in [Section 15](#15-research-references-and-official-documentation)).
+
+**Step 2 — parsing.** Those 108 tokens get consumed by the recursive-descent parser into an AST. Here's exactly what happens, function-call by function-call, for one real piece of that program — the expression `a + b` inside `add`'s `return` statement:
+
+```mermaid
+flowchart TB
+    CALL1["parse_statement()<br/>sees 'Return' token"] --> CALL2["parse_expression()<br/>called for the return value"]
+    CALL2 --> CALL3["parse_term()<br/>(handles + and - at this precedence level)"]
+    CALL3 --> CALL4["parse_factor()<br/>sees Ident('a') — a leaf, returns immediately"]
+    CALL3 --> SEEPLUS["sees 'Plus' token next,<br/>so this IS a binary expression"]
+    SEEPLUS --> CALL5["parse_factor() again<br/>sees Ident('b') — another leaf"]
+    CALL4 --> NODE["builds one AST node:<br/>BinaryOp{ op: Add, left: Var('a'), right: Var('b') }"]
+    CALL5 --> NODE
+```
+
+**Walkthrough**: this is what "recursive descent" concretely means — `parse_expression` doesn't know anything about `+` directly, it delegates to `parse_term`, which recognizes the `Plus` token sitting between two things it already knows how to parse (via `parse_factor`, which in turn would recursively call back into `parse_expression` for something like a parenthesized sub-expression — the "descent" part of the name). The *end result*, after all those function calls return, is a single tree node: a `BinaryOp` with `Add` as the operator and two leaf nodes (`a` and `b`) as its children. Every expression in a `.kn` program, no matter how deeply nested, is built by exactly this same pattern of functions calling each other and handing back increasingly larger tree nodes.
+
+**Step 3 — checking.** `hello.kn` has no moves, no borrows, no `unsafe` blocks — it passes the checker with zero findings, instantly.
+
+**Step 4a — interpreting.** `kernel trace examples/hello.kn` produces this exact, real JSON:
+
+```json
+{"output":["15"],"trace":["let x = 5","let y = 10"],"final_value":"()"}
+```
+
+`"15"` is `add(5, 10)`'s real result, printed by `print(add(x, y))`. The `trace` array (used by Kernel-LLM as training signal) records the two `let` bindings that happened before the print call.
+
+**Step 4b/5 — code generation and native compilation.** `kernel build examples/hello.kn out.bin` produces this complete, real, unedited C file:
+
+```c
+/* AUTO-GENERATED by the Kernel (.kn) v1 compiler. Do not edit by hand. */
+#include <stdint.h>
+#include <stdbool.h>
+
+void kernel_print_char(char c);
+void kernel_print_str(const char *s);
+void kernel_print_long(long n);
+void kernel_print_float(double x);
+void kernel_print_bool(bool b);
+void kernel_print_space(void);
+void kernel_print_newline(void);
+long kernel_abs(long x);
+double kernel_fabs(double x);
+const char *kernel_strcat(const char *a, const char *b);
+
+struct Point {
+    long x;
+    long y;
+};
+
+
+long add(long a, long b);
+const char* classify(long n);
+void kmain();
+
+long add(long a, long b) {
+    return (a + b);
+}
+
+const char* classify(long n) {
+    if ((n < 0)) {
+        return "negative";
+    }
+    else if ((n == 0)) {
+        return "zero";
+    }
+    else {
+        return "positive";
+    }
+}
+
+void kmain() {
+    long x = 5;
+    long y = 10;
+    kernel_print_long(add(x, y));
+    kernel_print_newline();
+}
+```
+
+A few things worth noticing directly from this real output: Kernel's `int` becomes C's `long` (not `int` — chosen for a consistent, predictable width); `main()` in your `.kn` source becomes `kmain()` in the generated C (so it can't collide with anything expecting a normal C `main`); every function gets a forward declaration before its definition (so functions can call each other regardless of source order, which the checked AST already guarantees is semantically valid); and every `print(...)` call becomes a specific `kernel_print_*` call chosen by the compiler based on the argument's type — none of which exist in a standard C library at all, because this is a freestanding environment with no libc (see [Section 7](#7-compiling-to-a-real-bootable-binary)).
+
 ---
 
 ## 5. The Compiler Pipeline, Stage by Stage
@@ -260,6 +395,21 @@ The CLI exposes four commands, all backed by this same pipeline:
 - `kernel trace <file>` — same as `run`, but output is structured JSON with a full execution trace (used by Kernel-LLM's training-data generator)
 - `kernel build <file> <output>` — the full pipeline through native compilation, producing a real binary
 
+```mermaid
+flowchart LR
+    LEXSTAGE(["Lexer"]) --> PARSESTAGE(["Parser"]) --> CHECKSTAGE(["Checker"])
+    CHECKSTAGE --> INTERPSTAGE(["Interpreter"])
+    CHECKSTAGE --> CODEGENSTAGE(["Codegen"])
+    CODEGENSTAGE --> NATIVESTAGE(["gcc/as/ld"])
+
+    TOKENSCMD["kernel tokens"] -.->|"stops after"| LEXSTAGE
+    RUNCMD["kernel run"] -.->|"stops after"| INTERPSTAGE
+    TRACECMD["kernel trace"] -.->|"stops after,<br/>JSON output instead"| INTERPSTAGE
+    BUILDCMD["kernel build"] -.->|"stops after"| NATIVESTAGE
+```
+
+**Walkthrough**: this is a map of exactly how much of the pipeline each CLI command actually exercises — useful for knowing which command to reach for while debugging *the compiler itself*, not just a `.kn` program. `kernel tokens` is the shallowest, useful only for checking the lexer is tokenizing correctly. `kernel run` and `kernel trace` both go all the way through the checker and the interpreter — they differ only in *how* the result is reported (human-readable print statements vs. structured JSON for a downstream consumer like Kernel-LLM's corpus generator). `kernel build` is the only command that ever touches code generation or leaves Rust's own process at all — it's the one that hands off to `gcc`/`as`/`ld`, external tools Kernel doesn't control, which is also exactly why the three real bugs in [Section 10](#10-real-bugs-found-and-fixed-engineering-evidence-not-claims) were specifically the kind that only surfaced when someone actually ran `build`, not `run` — the interpreter path and the native-compilation path can silently diverge if nobody's testing both.
+
 ---
 
 ## 6. The Ownership Model — Memory Safety Without Rust's Tax
@@ -290,6 +440,61 @@ flowchart TB
 **What it deliberately doesn't do (yet)**: Rust's *complete* borrow checker also detects simultaneous mutable/immutable borrow conflicts (e.g., holding a mutable reference and a regular reference to the same data at the same time) — this is a substantially harder static-analysis problem, formally the subject of real ongoing PL research (see Rust's own Non-Lexical Lifetimes work and the Oxide formalization paper, both cited in [Section 15](#15-research-references-and-official-documentation)). Kernel v1 does not implement this half of the problem — it's named explicitly as deferred work, not silently missing.
 
 **The actual trade-off, stated plainly**: Kernel gets you real, compiler-enforced protection against an entire class of memory bugs (use-after-move/use-after-free-equivalent) with zero lifetime annotations to write, in exchange for *not yet* catching a narrower, harder class of bugs (simultaneous aliasing conflicts) that Rust's full borrow checker does catch. This isn't "as safe as Rust" — it's a real, honestly-scoped subset.
+
+### 6.1 Proof: Borrows Really Do Become Pointers (Real Generated Code)
+
+This directly verifies the Revision 3 bug fix described in [Section 10](#10-real-bugs-found-and-fixed-engineering-evidence-not-claims) is still correct today — compiling `examples/branch_borrow_ok.kn` (a program that borrows the same struct inside both arms of an `if`, then safely moves it afterward) produces this real, unedited C:
+
+```kn
+struct Point:
+    x: int
+    y: int
+
+fn peek(p: &Point):
+    print(p.x)
+
+fn take(p: Point):
+    print(p.x)
+
+fn main():
+    let origin = Point(x: 1, y: 2)
+    let flag = 1
+    if flag == 1:
+        peek(&origin)      # borrow only, both arms
+    else:
+        peek(&origin)
+    take(origin)            # fine: origin was never moved in either arm
+```
+
+```c
+void peek(struct Point* p);
+void take(struct Point p);
+void kmain();
+
+void peek(struct Point* p) {
+    kernel_print_long(p->x);
+    kernel_print_newline();
+}
+
+void take(struct Point p) {
+    kernel_print_long(p.x);
+    kernel_print_newline();
+}
+
+void kmain() {
+    struct Point origin = (struct Point){.x = 1, .y = 2};
+    long flag = 1;
+    if ((flag == 1)) {
+        peek((&origin));
+    }
+    else {
+        peek((&origin));
+    }
+    take(origin);
+}
+```
+
+Look closely at the two function signatures: `peek(p: &Point)` (a *borrow* in Kernel source) compiles to `void peek(struct Point* p)` — a real C pointer. `take(p: Point)` (a *move* in Kernel source, no `&`) compiles to `void take(struct Point p)` — the struct passed **by value**, a full copy. This distinction is exactly what the Revision 3 bug (documented in Section 10) got backwards for a while: the generated signature for a borrowed parameter was by-value instead of by-pointer, a real type mismatch that `gcc` would have caught as an error. Confirming it's correct here isn't redundant with Section 10 — Section 10 documents that the bug *was* found and fixed; this is independent, fresh proof that the fix is still correct in the current compiler, verified by actually running `kernel build` again, not by re-reading old notes.
 
 ---
 
@@ -327,6 +532,79 @@ sequenceDiagram
 **Walkthrough**: this is the exact sequence that happens behind the single command `kernel build ... && qemu-system-i386 -kernel out.bin`, spelled out step by step. Notice the handoff pattern: the developer never talks to `gcc` or QEMU's internals directly — `kernel build` is the only thing that knows how to orchestrate the C compiler and the Kernel-specific runtime glue together, and QEMU is the only thing that knows how to interpret the Multiboot header `boot.s` wrote into the binary. The two `Bin->>Bin` steps in the middle are the moment that actually matters most: `boot.s` (hand-written assembly, not generated from your `.kn` code at all) has to run *first*, because it's what sets up the minimal environment (stack, memory layout per `link.ld`) that the generated C code from *your* program assumes already exists by the time it starts running. Only after that handoff does anything resembling "your program" actually execute.
 
 The verification isn't "it compiles without errors" — it's that the *actual rendered output on the emulated screen* matches, character for character, what the same program produces when run through the interpreter instead. Including the raw `write_vga` MMIO call landing on the exact byte address specified.
+
+### 7.1 Real Boot Internals — `boot.s`, `link.ld`, and the VGA Address Math
+
+This is the actual, complete, hand-written assembly entry point (`kernel_runtime/boot.s`) — not a simplified summary:
+
+```asm
+.set MB_MAGIC, 0x1BADB002
+.set MB_FLAGS, 0x0
+.set MB_CHECKSUM, -(MB_MAGIC + MB_FLAGS)
+
+.section .multiboot
+.align 4
+.long MB_MAGIC
+.long MB_FLAGS
+.long MB_CHECKSUM
+
+.section .bss
+.align 16
+stack_bottom:
+.skip 16384 /* 16 KiB stack */
+stack_top:
+
+.section .text
+.global _start
+_start:
+    mov $stack_top, %esp
+    call kernel_init
+    call kmain
+hang:
+    cli
+    hlt
+    jmp hang
+```
+
+And the real linker script (`kernel_runtime/link.ld`) controlling exactly where every piece of that lands in memory:
+
+```ld
+ENTRY(_start)
+SECTIONS {
+    . = 0x100000;
+    .text : {
+        *(.multiboot)
+        *(.text)
+    }
+    .rodata : { *(.rodata*) }
+    .data : { *(.data) }
+    .bss : {
+        *(COMMON)
+        *(.bss)
+    }
+}
+```
+
+```mermaid
+flowchart TB
+    subgraph memory["Final binary's memory layout (from link.ld)"]
+        direction TB
+        ADDR["0x100000 (1 MiB)<br/>— the fixed load address"] --> TEXTSEC[".text section<br/>Multiboot header FIRST,<br/>then all executable code<br/>(boot.s + generated C)"]
+        TEXTSEC --> RODATASEC[".rodata section<br/>string literals, e.g. 'negative'/'zero'/'positive'"]
+        RODATASEC --> DATASEC[".data section<br/>initialized mutable globals"]
+        DATASEC --> BSSSEC[".bss section<br/>uninitialized globals<br/>(e.g. the string-concat buffer pool)<br/>zero-filled at load, not stored in the file"]
+    end
+```
+
+**Walkthrough on `boot.s`**: the very first three `.long` values (`MB_MAGIC`, `MB_FLAGS`, `MB_CHECKSUM`) are the entire Multiboot header — 12 bytes that QEMU/GRUB scan for before trusting anything else in the file. `MB_CHECKSUM` is deliberately computed as the *negation* of the sum of the other two fields, so that magic + flags + checksum always sums to exactly zero — a real bootloader validates this arithmetic, not just the magic number alone, specifically to catch corrupted images. After that header, `_start` is the actual first instruction executed: it points the stack pointer (`%esp`) at `stack_top` (the *top* of a 16 KiB region reserved in `.bss`, since x86 stacks grow downward), then calls `kernel_init` (clears the screen, disables the blinking hardware cursor) and finally `kmain` (your compiled `.kn` program's entry point). If `kmain` ever returns, execution falls through to `hang`, which disables interrupts (`cli`) and halts the CPU (`hlt`) in an infinite loop — there's no operating system underneath to "return to."
+
+**Walkthrough on `link.ld`**: the single line `. = 0x100000;` is the whole reason this boots reliably — it tells the linker "everything starts at address 1 MiB," a conventional, safe choice for freestanding x86 images since it sits above the lowest megabyte of real-mode-era memory that's historically reserved for BIOS data structures. The four sections are laid out in a fixed order, `.text` first specifically so the Multiboot header (which must appear within the file's first 8192 bytes per the specification) lands early enough to be found.
+
+**The VGA address, worked out exactly**: `examples/boot_demo.kn` writes to address `757504`. The VGA text buffer itself starts at `0xB8000` (decimal 753664) and holds 80×25 two-byte cells (one byte for the character, one for its color attribute). `757504 − 753664 = 3840`; `3840 ÷ 2 = 1920`; `1920 ÷ 80 = 24` with a remainder of `0`. So address `757504` is cell **row 24, column 0** — the very last row of an 80×25 screen, first column. That's real, computed directly from the constants in `runtime.c` (`VGA_BUFFER` at `0xB8000`, `VGA_COLS = 80`), not an approximation.
+
+### 7.2 The Freestanding Runtime's Real Limitations
+
+`kernel_runtime/runtime.c` is hand-written support code (not generated), and it has a genuine, documented constraint worth stating plainly: there is no heap allocator in this freestanding environment, so string concatenation (`kernel_strcat`) can't allocate memory the normal way. Instead it writes into a **fixed rotating pool of 8 static buffers, 256 bytes each** — meaning after 8 concatenation results are "alive" at once without being consumed, the 9th overwrites the oldest. This is a real, intentional trade-off (not a bug), but it is a genuine capacity limit that a program doing heavy string work could actually hit — see [Section 14](#14-honest-limitations).
 
 ---
 
@@ -380,17 +658,18 @@ Each of these is documented in full, including the exact reasoning and fix, in `
 
 ---
 
-## 11. How This Compares to Rust, Python, Go, and C
+## 11. How This Compares to Rust, Python, Go, C, and Zig
 
-| Aspect | Rust | Python | C | Kernel |
-|---|---|---|---|---|
-| Memory safety | Yes, compile-time (full borrow checker) | Yes, but via garbage collection (runtime, not compile-time) | No | Partial, compile-time (move-checking; no borrow-conflict detection yet) |
-| Syntax style | Braces, semicolons, explicit lifetimes | Indentation-based, no braces | Braces, semicolons | Indentation-based, no braces — matches Python, not Rust/C |
-| Compiles to a real binary | Yes | Not natively (interpreted, or needs embedding tools) | Yes | Yes (v1, via C/gcc) |
-| Learning curve for safety | Steep — borrow checker + lifetime annotations widely cited as the top adoption barrier | N/A (no compile-time safety to learn) | N/A (no compile-time safety to learn) | Lower — move/borrow rules with zero lifetime syntax to write |
-| Current real-world maturity | Extremely mature, production-grade, large ecosystem | Extremely mature | Extremely mature | v1 only — proves the pipeline works, not production-ready |
+| Aspect | Rust | Python | C | Zig | Kernel |
+|---|---|---|---|---|---|
+| Memory safety | Yes, compile-time (full borrow checker) | Yes, but via garbage collection (runtime, not compile-time) | No | Runtime safety checks in debug/safe build modes (bounds checks, overflow detection — crashes instead of undefined behavior), not compile-time ownership tracking | Partial, compile-time (move-checking; no borrow-conflict detection yet) |
+| Syntax style | Braces, semicolons, explicit lifetimes | Indentation-based, no braces | Braces, semicolons | Braces, semicolons, explicit `comptime` | Indentation-based, no braces — matches Python, not Rust/C/Zig |
+| Compiles to a real binary | Yes | Not natively (interpreted, or needs embedding tools) | Yes | Yes | Yes (v1, via C/gcc) |
+| Learning curve for safety | Steep — borrow checker + lifetime annotations widely cited as the top adoption barrier | N/A (no compile-time safety to learn) | N/A (no compile-time safety to learn) | Lower than Rust — no ownership model to learn, but manual memory management (explicit allocators) is still the programmer's full responsibility | Lower — move/borrow rules with zero lifetime syntax to write |
+| Memory management model | Ownership/borrowing (compiler-tracked) | Garbage collected | Fully manual (`malloc`/`free`, no safety net) | Fully manual, but explicit — every allocating function takes an `Allocator` parameter, so "does this allocate" is always visible in a signature | Ownership/move-based (compiler-tracked), same category as Rust, not Zig/C |
+| Current real-world maturity | Extremely mature, production-grade, large ecosystem | Extremely mature | Extremely mature | Pre-1.0 but widely used in production by early adopters | v1 only — proves the pipeline works, not production-ready |
 
-Kernel is not claiming to be "as capable as Rust" today — it's a from-scratch v1 proving a specific, narrower bet: that a real subset of Rust's safety guarantee is reachable with Python's syntax ergonomics, with the harder remaining 20% (borrow-conflict detection) explicitly scoped as future work rather than glossed over.
+Kernel is not claiming to be "as capable as Rust" today — it's a from-scratch v1 proving a specific, narrower bet: that a real subset of Rust's safety guarantee is reachable with Python's syntax ergonomics, with the harder remaining 20% (borrow-conflict detection) explicitly scoped as future work rather than glossed over. Zig is included here specifically because it's the most directly comparable *recent* language in this exact space (modern systems programming, positioning itself against both C and Rust) — and it's worth being precise about the real difference: Zig's safety is a disciplined *runtime*-checked model (crash on violation in safe builds, with those checks removable for performance), while Kernel's (like Rust's) is a *compile-time* static-analysis model that rejects unsafe code before it ever runs at all. Neither is strictly "better" in the abstract — they're different points on the same safety/control trade-off.
 
 ---
 
@@ -470,6 +749,7 @@ Stated as directly as everywhere else in this document:
 - **No simultaneous mutable/immutable borrow-conflict detection.** Move-checking is complete and verified across all of v1's control-flow shapes; this separate, harder problem is not attempted yet.
 - **Only C-style enums**, not Rust-style tagged unions with associated data.
 - **No intermediate representation (IR)** between the checked AST and C code generation — a real, acknowledged simplification that will need addressing once a second backend (LLVM, v2) exists.
+- **String concatenation uses a fixed rotating pool of 8 static 256-byte buffers**, not real dynamic allocation — there's no heap in this freestanding environment, so a 9th concurrently-"alive" concatenation result silently overwrites the oldest one still in use. Real, documented ([Section 7.2](#72-the-freestanding-runtimes-real-limitations)), not discovered by accident.
 - **v1 targets a specific, narrow proof** (boots in QEMU, pixel-exact vs. the interpreter) — it is explicitly not a production-ready systems language yet, and the roadmap beyond v1 (backend/web/mobile/full-stack/ML/quantum/embedded/blockchain) is a researched plan, not built or tested.
 
 None of this is hidden in a separate document only engineers would find — it's stated in this same guide, matching the honesty standard applied throughout this project's own architecture decision records.
@@ -499,6 +779,7 @@ Research papers and official specifications only — no blog posts or secondary 
 | Cargo (Rust's build system) | Official Cargo documentation | [doc.rust-lang.org/cargo](https://doc.rust-lang.org/cargo/) |
 | LLVM (the planned v2 backend) | Official LLVM documentation | [llvm.org/docs](https://llvm.org/docs/) |
 | `inkwell` (Rust bindings to LLVM, planned for v2) | Official `inkwell` documentation | [thedan64.github.io/inkwell](https://thedan64.github.io/inkwell/inkwell/index.html) |
+| Zig (comparison language, [Section 11](#11-how-this-compares-to-rust-python-go-c-and-zig)) | Official Zig documentation — "Overview" and "Why Zig" pages | [ziglang.org/learn/overview](https://ziglang.org/learn/overview/), [ziglang.org/learn/why_zig_rust_d_cpp](https://ziglang.org/learn/why_zig_rust_d_cpp/) |
 
 ### 15.3 Classic compiler-construction reference
 

@@ -33,6 +33,7 @@ pub fn lambda_lift(program: Program) -> Program {
             Item::Function(f) => Some(f.name.clone()),
             Item::Struct(s) => Some(s.name.clone()),
             Item::Static { name, .. } | Item::Const { name, .. } => Some(name.clone()),
+            Item::Import(_) => unreachable!("Kernel lambda-lift: Item::Import should always be resolved by modules.rs before this runs"),
         })
         .collect();
 

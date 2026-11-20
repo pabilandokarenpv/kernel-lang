@@ -205,6 +205,18 @@ impl Parser {
                 let value = self.parse_expr();
                 Item::Const { name, ty, value }
             }
+            Token::Import => {
+                self.advance();
+                // Dotted module path, e.g. `import utils.math` -- see
+                // ast.rs's Item::Import doc comment for how modules.rs
+                // resolves this to a file.
+                let mut path = self.ident();
+                while self.eat(&Token::Dot) {
+                    path.push('.');
+                    path.push_str(&self.ident());
+                }
+                Item::Import(path)
+            }
             other => panic!("Kernel parser: unexpected top-level token {:?}", other),
         }
     }

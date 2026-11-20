@@ -1,0 +1,8 @@
+import utils
+import geometry
+
+fn main():
+    print(add(2, 3))
+    let p = make_origin()
+    print(p.x)
+    print(p.y)

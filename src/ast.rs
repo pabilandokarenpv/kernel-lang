@@ -15,6 +15,22 @@ pub enum Item {
     Struct(StructDecl),
     Static { name: String, mutable: bool, ty: String, value: Expr },
     Const { name: String, ty: String, value: Expr },
+    // `import foo` / `import utils.math` -- v1.x module system (Option C).
+    // Resolved and ERASED entirely by modules.rs, the very first pass run
+    // (before monomorphize/lambda_lift/check): it reads the target file
+    // (dotted segments become path components, e.g. "utils.math" ->
+    // "utils/math.kn", resolved relative to the IMPORTING file's own
+    // directory -- no project-root/manifest concept needed for this),
+    // recursively resolves ITS imports too, and splices its top-level
+    // items directly into the importing program. No qualified names, no
+    // pub/private visibility -- every imported item becomes a plain,
+    // unqualified top-level name, exactly as if it had been pasted in.
+    // A module imported from multiple places in the same program is only
+    // included once (cycle/duplicate-safe, like a C header guard).
+    // checker.rs/interpreter.rs/codegen_c.rs/monomorphize.rs/
+    // lambda_lift.rs never see this variant -- it's always gone by the
+    // time any of them run.
+    Import(String),
 }
 
 #[derive(Debug, Clone)]

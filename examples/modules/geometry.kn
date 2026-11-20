@@ -1,0 +1,6 @@
+struct Point:
+    x: int
+    y: int
+
+fn make_origin() -> Point:
+    return Point(x: 0, y: 0)

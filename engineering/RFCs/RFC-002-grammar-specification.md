@@ -120,11 +120,28 @@ a silent miscompile.
   A real, named interpreter/codegen asymmetry, not every builtin needs
   to exist on both backends -- but it must fail LOUDLY on the one it
   doesn't.
-- **No module/import system yet** (`import` is a reserved keyword in the
-  lexer, unused by the parser) -- every program is a single file. A
-  package manager has nothing to manage until this exists, so it's
-  explicitly NOT started, named here rather than implied done just
-  because other Option C work (the LSP, these stdlib builtins) landed.
+- **A module/import system now exists**: `import foo` / `import utils.math`
+  (see `modules.rs`). v1.x scope: unqualified textual splice (no
+  qualified names, no pub/private visibility -- every imported item
+  becomes a plain top-level name, exactly as if pasted in), resolved
+  relative to the IMPORTING file's own directory, cycle/duplicate-import
+  safe (like a C header guard), with a loud error on a genuine name
+  collision across files (checker.rs/interpreter.rs/codegen_c.rs all
+  build their tables via plain `HashMap::insert`, which would otherwise
+  silently let a later definition overwrite an earlier one). Runs as the
+  very first pass, before monomorphize/lambda_lift, so a generic function
+  or closure defined in an imported file is handled identically to one in
+  the entry file. The LSP (`kernel lsp`) resolves imports too, relative
+  to the open document's own path.
+- **A package manifest skeleton**: `kernel.toml` (flat `key = "value"`
+  lines, NOT full TOML -- no sections/nesting, hand-parsed, no
+  dependency) naming a project and its `entry` file; `kernel init`
+  scaffolds one. `kernel run`/`kernel build` read it when no explicit
+  path is given. Deliberately named a SKELETON: no registry, no remote
+  dependencies, no version resolution -- it only establishes the two
+  integration points (a manifest file, and commands that read it) a real
+  future package manager would build on, now that the module system
+  above gives a project something to actually span multiple files for.
 
 ## Two run modes
 
@@ -133,6 +150,7 @@ a silent miscompile.
 | `kernel run file.kn` | interpreter.rs | Dev-mode, Python-speed iteration |
 | `kernel build file.kn out.bin` | codegen_c.rs → gcc/as/ld | Optimized, freestanding compiled binary |
 | `kernel lsp` | lsp.rs | Language server (JSON-RPC over stdio) -- real IDE diagnostics |
+| `kernel init [name]` | manifest.rs | Scaffolds `kernel.toml` + `main.kn` for a new project |
 
 ## Developer experience: a real LSP server (Option C, v1.x)
 

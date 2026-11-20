@@ -6,6 +6,8 @@ mod json;
 mod lambda_lift;
 mod lexer;
 mod lsp;
+mod manifest;
+mod modules;
 mod monomorphize;
 mod parser;
 
@@ -16,6 +18,7 @@ use lexer::Lexer;
 use parser::Parser;
 use std::env;
 use std::fs;
+use std::path::Path;
 use std::process::{self, Command};
 
 const RUNTIME_DIR: &str = env!("CARGO_MANIFEST_DIR");
@@ -26,34 +29,61 @@ fn main() {
     let subcmd = args.get(1).map(|s| s.as_str());
     match subcmd {
         Some("tokens") => {
-            let path = args.get(2).map(|s| s.as_str()).unwrap_or("examples/hello.kn");
-            cmd_tokens(path);
+            let path = resolve_entry_path(args.get(2).map(|s| s.as_str()));
+            cmd_tokens(&path);
         }
         Some("run") => {
-            let path = args.get(2).map(|s| s.as_str()).unwrap_or("examples/hello.kn");
-            cmd_run(path);
+            let path = resolve_entry_path(args.get(2).map(|s| s.as_str()));
+            cmd_run(&path);
         }
         Some("build") => {
-            let path = args.get(2).map(|s| s.as_str()).unwrap_or("examples/hello.kn");
+            let path = resolve_entry_path(args.get(2).map(|s| s.as_str()));
             let out = args.get(3).map(|s| s.as_str()).unwrap_or("kernel.bin");
-            cmd_build(path, out);
+            cmd_build(&path, out);
         }
         Some("trace") => {
-            let path = args.get(2).map(|s| s.as_str()).unwrap_or("examples/hello.kn");
-            cmd_trace(path);
+            let path = resolve_entry_path(args.get(2).map(|s| s.as_str()));
+            cmd_trace(&path);
         }
         Some("lsp") => {
             lsp::run_lsp_server();
         }
+        Some("init") => {
+            let name = args.get(2).map(|s| s.as_str()).unwrap_or("unnamed");
+            manifest::cmd_init(name);
+        }
         Some(p) => cmd_run(p),
-        None => cmd_run("examples/hello.kn"),
+        None => cmd_run(&resolve_entry_path(None)),
     }
+}
+
+// Explicit path on the CLI always wins; otherwise, if a `kernel.toml`
+// manifest exists in the current directory, use its `entry` field; else
+// fall back to the original pre-manifest default -- preserves exact
+// existing behavior for anyone not using a manifest at all. See
+// manifest.rs's doc comment for the honest "skeleton, not a real package
+// manager" scope.
+fn resolve_entry_path(explicit: Option<&str>) -> String {
+    if let Some(p) = explicit {
+        return p.to_string();
+    }
+    if let Some(m) = manifest::load_manifest() {
+        eprintln!("[kernel.toml] project: {}", m.name);
+        return m.entry;
+    }
+    "examples/hello.kn".to_string()
 }
 
 fn load_checked(path: &str) -> ast::Program {
     let src = fs::read_to_string(path).unwrap_or_else(|e| panic!("could not read {}: {}", path, e));
     let tokens = Lexer::new(&src).tokenize();
     let program = Parser::new(tokens).parse_program();
+    // The module system (v1.x) runs FIRST, before any other pass -- every
+    // `import` is resolved and spliced into one flat program here, so
+    // generics/closures defined in an imported file are just as real to
+    // monomorphize.rs/lambda_lift.rs as ones in the entry file itself (see
+    // modules.rs).
+    let program = modules::resolve_modules(Path::new(path), program);
     // Generics (v1.x) are fully erased here, before the checker ever runs:
     // every generic fn/struct is replaced by one concrete, mangled copy per
     // distinct type it's actually instantiated with (see monomorphize.rs).

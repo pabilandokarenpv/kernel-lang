@@ -104,6 +104,7 @@ impl Interpreter {
                     let v = self.eval(value);
                     self.globals.insert(name.clone(), v);
                 }
+                Item::Import(_) => unreachable!("Kernel interpreter: Item::Import should always be resolved by modules.rs before this runs"),
             }
         }
     }

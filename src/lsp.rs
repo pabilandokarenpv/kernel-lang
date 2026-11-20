@@ -35,8 +35,10 @@ use crate::json::Json;
 use crate::lambda_lift;
 use crate::lexer::Lexer;
 use crate::monomorphize;
+use crate::modules;
 use crate::parser::Parser;
 use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
 
 struct Diagnostic {
     line: usize, // 1-indexed; converted to LSP's 0-indexed on the wire
@@ -44,13 +46,25 @@ struct Diagnostic {
     message: String,
 }
 
-// Runs the real compiler pipeline against `src`, catching any lex/parse/
-// lambda-lift panic instead of letting it kill the server process -- see
-// this module's doc comment for why that's necessary here specifically.
-fn analyze(src: &str) -> Vec<Diagnostic> {
+// Best-effort LSP URI -> filesystem path: strips the `file://` scheme.
+// Doesn't decode percent-escapes (e.g. `%20` for a space in a path) -- a
+// real, named v1.x rough edge, not silently wrong for the common case of
+// a plain ASCII path with no special characters, which is what every
+// editor sends for a typical project layout.
+fn uri_to_path(uri: &str) -> PathBuf {
+    PathBuf::from(uri.strip_prefix("file://").unwrap_or(uri))
+}
+
+// Runs the real compiler pipeline against `src` (the document open at
+// `path`, needed so `import` resolves relative to the right directory --
+// see modules.rs), catching any lex/parse/module/lambda-lift panic
+// instead of letting it kill the server process -- see this module's doc
+// comment for why that's necessary here specifically.
+fn analyze(path: &Path, src: &str) -> Vec<Diagnostic> {
     let result = std::panic::catch_unwind(|| {
         let tokens = Lexer::new(src).tokenize();
         let program = Parser::new(tokens).parse_program();
+        let program = modules::resolve_modules(path, program);
         let program = monomorphize::monomorphize(program);
         let program = lambda_lift::lambda_lift(program);
         Checker::new(&program).check(&program)
@@ -156,7 +170,8 @@ fn send_notification(writer: &mut impl Write, method: &str, params: Json) {
 }
 
 fn publish_diagnostics(writer: &mut impl Write, uri: &str, text: &str) {
-    let diags = analyze(text);
+    let path = uri_to_path(uri);
+    let diags = analyze(&path, text);
     let json_diags: Vec<Json> = diags
         .into_iter()
         .map(|d| {

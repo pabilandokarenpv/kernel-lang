@@ -5,21 +5,28 @@ use crate::ast::*;
 use crate::lexer::Token;
 
 pub struct Parser {
-    tokens: Vec<Token>,
+    tokens: Vec<(Token, usize, usize)>,
     pos: usize,
 }
 
 impl Parser {
-    pub fn new(tokens: Vec<Token>) -> Self {
+    pub fn new(tokens: Vec<(Token, usize, usize)>) -> Self {
         Parser { tokens, pos: 0 }
     }
 
     fn cur(&self) -> &Token {
-        self.tokens.get(self.pos).unwrap_or(&Token::Eof)
+        self.tokens.get(self.pos).map(|t| &t.0).unwrap_or(&Token::Eof)
+    }
+
+    // (line, col) of the CURRENT (not-yet-consumed) token -- for error
+    // messages and, eventually, LSP diagnostics. 1-indexed, (0, 0) past
+    // end of input.
+    fn cur_pos(&self) -> (usize, usize) {
+        self.tokens.get(self.pos).map(|t| (t.1, t.2)).unwrap_or((0, 0))
     }
 
     fn advance(&mut self) -> Token {
-        let t = self.tokens.get(self.pos).cloned().unwrap_or(Token::Eof);
+        let t = self.tokens.get(self.pos).map(|t| t.0.clone()).unwrap_or(Token::Eof);
         self.pos += 1;
         t
     }
@@ -41,7 +48,8 @@ impl Parser {
         if self.check(&t) {
             self.advance()
         } else {
-            panic!("Kernel parser: expected {:?}, found {:?} at token {}", t, self.cur(), self.pos);
+            let (line, col) = self.cur_pos();
+            panic!("Kernel parser: expected {:?}, found {:?} at line {}, column {}", t, self.cur(), line, col);
         }
     }
 
@@ -52,9 +60,10 @@ impl Parser {
     }
 
     fn ident(&mut self) -> String {
+        let (line, col) = self.cur_pos(); // captured BEFORE advance() below moves past it
         match self.advance() {
             Token::Ident(s) => s,
-            other => panic!("Kernel parser: expected identifier, found {:?}", other),
+            other => panic!("Kernel parser: expected identifier, found {:?} at line {}, column {}", other, line, col),
         }
     }
 
@@ -736,7 +745,7 @@ impl Parser {
                     while !self.check(&Token::RParen) {
                         // lookahead: `ident :` means a named arg (struct field)
                         if let Token::Ident(argname) = self.cur().clone() {
-                            if self.tokens.get(self.pos + 1) == Some(&Token::Colon) {
+                            if self.tokens.get(self.pos + 1).map(|t| &t.0) == Some(&Token::Colon) {
                                 self.advance(); // ident
                                 self.advance(); // colon
                                 let v = self.parse_expr();

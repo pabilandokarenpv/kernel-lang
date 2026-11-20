@@ -57,12 +57,16 @@ Documented v1 scope limitations (not silent gaps):
 - borrow-conflict detection is lexically scoped (a borrow is "alive" until
   the end of its enclosing block), not full Non-Lexical-Lifetime analysis
   (alive only until its actual last use) — see ARD-003 Revision 4
-- generics/traits/pattern-matching/closures aren't implemented in the
-  interpreter/codegen yet — they exist in the syntax spec for LLM-corpus
-  variety and get added incrementally when building that corpus generator
+- generics/pattern-matching/closures ARE implemented (v1.x additions, not
+  silent extras -- see RFC-002's "v1.x additions" section for each one's
+  honest scope): monomorphization for generics, parse-time desugaring for
+  `match`, lambda-lifting for closures. Traits and Rust-style tagged-union
+  enums remain unimplemented.
 - AST lowers straight to C (no separate Kernel IR yet) — deliberate, a formal
   pluggable-backend IR only earns its keep once there's a second backend
   (LLVM, v2) to validate it against
+- a real LSP server (`kernel lsp`) exists for diagnostics (see RFC-002) —
+  no hover/completion/go-to-definition yet
 
 ## Roadmap
 

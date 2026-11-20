@@ -81,6 +81,11 @@ pub struct Lexer {
     indent_stack: Vec<usize>,
     pending: Vec<Token>,
     at_line_start: bool,
+    line: usize, // 1-indexed, tracked only so tokenize() can attach a
+    col: usize,  // (line, col) to every token -- needed for real tooling
+    // (the LSP server, better panic messages) that this project had no
+    // position info for at all until now; every other lexer field/method
+    // is unchanged, this only touches advance() and tokenize()'s signature.
 }
 
 impl Lexer {
@@ -91,6 +96,8 @@ impl Lexer {
             indent_stack: vec![0],
             pending: Vec::new(),
             at_line_start: true,
+            line: 1,
+            col: 1,
         }
     }
 
@@ -104,40 +111,53 @@ impl Lexer {
 
     fn advance(&mut self) -> Option<char> {
         let c = self.peek();
-        if c.is_some() {
+        if let Some(ch) = c {
             self.pos += 1;
+            if ch == '\n' {
+                self.line += 1;
+                self.col = 1;
+            } else {
+                self.col += 1;
+            }
         }
         c
     }
 
-    pub fn tokenize(mut self) -> Vec<Token> {
+    // Returns (token, line, col) triples instead of bare tokens -- parser.rs
+    // stores the richer tuple but exposes the same `&Token`/`Token` surface
+    // via cur()/advance() as before (plus a new cur_pos()), so this doesn't
+    // ripple through every existing `match self.cur()` call site.
+    pub fn tokenize(mut self) -> Vec<(Token, usize, usize)> {
         let mut tokens = Vec::new();
 
         loop {
             if !self.pending.is_empty() {
-                tokens.push(self.pending.remove(0));
+                let pos = (self.line, self.col);
+                tokens.push((self.pending.remove(0), pos.0, pos.1));
                 continue;
             }
 
             if self.at_line_start {
+                let pos = (self.line, self.col);
                 if let Some(tok) = self.handle_indentation() {
-                    tokens.push(tok);
+                    tokens.push((tok, pos.0, pos.1));
                     continue;
                 }
             }
 
+            let pos = (self.line, self.col);
             match self.next_token() {
                 Some(Token::Eof) | None => break,
-                Some(tok) => tokens.push(tok),
+                Some(tok) => tokens.push((tok, pos.0, pos.1)),
             }
         }
 
         // close out any remaining indents
         while self.indent_stack.len() > 1 {
             self.indent_stack.pop();
-            tokens.push(Token::Dedent);
+            tokens.push((Token::Dedent, self.line, self.col));
         }
-        tokens.push(Token::Eof);
+        tokens.push((Token::Eof, self.line, self.col));
         tokens
     }
 
@@ -349,7 +369,7 @@ impl Lexer {
             ']' => Token::RBracket,
             ';' => Token::Semicolon,
             '|' => Token::Pipe,
-            other => panic!("Kernel lexer: unexpected character '{}' at pos {}", other, self.pos),
+            other => panic!("Kernel lexer: unexpected character '{}' at line {}, column {}", other, self.line, self.col),
         })
     }
 }

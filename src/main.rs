@@ -2,8 +2,10 @@ mod ast;
 mod checker;
 mod codegen_c;
 mod interpreter;
+mod json;
 mod lambda_lift;
 mod lexer;
+mod lsp;
 mod monomorphize;
 mod parser;
 
@@ -39,6 +41,9 @@ fn main() {
         Some("trace") => {
             let path = args.get(2).map(|s| s.as_str()).unwrap_or("examples/hello.kn");
             cmd_trace(path);
+        }
+        Some("lsp") => {
+            lsp::run_lsp_server();
         }
         Some(p) => cmd_run(p),
         None => cmd_run("examples/hello.kn"),

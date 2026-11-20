@@ -110,6 +110,35 @@ a silent miscompile.
 |---|---|---|
 | `kernel run file.kn` | interpreter.rs | Dev-mode, Python-speed iteration |
 | `kernel build file.kn out.bin` | codegen_c.rs → gcc/as/ld | Optimized, freestanding compiled binary |
+| `kernel lsp` | lsp.rs | Language server (JSON-RPC over stdio) -- real IDE diagnostics |
+
+## Developer experience: a real LSP server (Option C, v1.x)
+
+`kernel lsp` runs the EXACT SAME pipeline as `kernel run`/`kernel build`
+(lex → parse → monomorphize → lambda_lift → check) against whatever's open
+in the editor and reports `textDocument/publishDiagnostics` -- a reported
+diagnostic means the same program would really fail to run/build, never a
+separate "IDE-only" analysis that could drift from what the compiler
+actually enforces. Hand-rolled JSON-RPC/JSON (`json.rs`), no external
+crates, matching ARD-004's identity.
+
+Honest v1.x scope:
+- Diagnostics only -- no hover, go-to-definition, completion, or
+  formatting yet.
+- Full-document sync (`textDocumentSync: 1`): the whole file is
+  re-analyzed on every change notification, not incremental.
+- LEX/PARSE errors get a REAL `(line, column)`, via new position tracking
+  added to the lexer/parser specifically for this (every token now
+  carries its source position; previously there was none at all).
+  CHECKER errors have no span yet -- the AST itself carries no position
+  info, only tokens do -- so those are reported at `(1, 1)` of the file,
+  a real precision gap pointing at a future "give the AST spans too" lift,
+  not a silently-pretended-accurate position.
+- The whole pipeline is panic-based error handling except the checker;
+  `kernel lsp` wraps every analysis in `catch_unwind` so a malformed
+  program reports a diagnostic instead of ever crashing the server
+  process -- verified against both a syntax error and a checker error in
+  a real stdio JSON-RPC session (see `tests/test_lsp.py`).
 
 ## Why this grammar shape
 

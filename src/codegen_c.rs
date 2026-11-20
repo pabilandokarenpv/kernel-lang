@@ -206,6 +206,7 @@ impl Codegen {
         out.push_str("long kernel_abs(long x);\n");
         out.push_str("double kernel_fabs(double x);\n");
         out.push_str("const char *kernel_strcat(const char *a, const char *b);\n");
+        out.push_str("long kernel_strlen(const char *s);\n");
         out.push_str("_Noreturn void kernel_panic(const char *msg);\n\n");
 
         // struct definitions
@@ -429,6 +430,32 @@ impl Codegen {
                     format!("kernel_abs({})", a)
                 }
             }
+            "len" => {
+                let arg = args.first().unwrap_or_else(|| panic!("Kernel codegen: len() requires exactly one argument"));
+                let arg_expr = match arg {
+                    CallArg::Positional(e) | CallArg::Named(_, e) => e,
+                };
+                let ty = self.infer_c_type(arg_expr, var_types);
+                if let Some((_, n)) = array_info(&ty) {
+                    // The array's size is a compile-time constant already
+                    // known from its type -- no runtime computation needed
+                    // at all, unlike the string case below.
+                    n.to_string()
+                } else if ty == "const char*" {
+                    format!("kernel_strlen({})", self.call_arg(arg, is_ptr, var_types))
+                } else {
+                    panic!(
+                        "Kernel codegen: len() only supports arrays and strings in v1.x, found a `{}`",
+                        ty
+                    );
+                }
+            }
+            "read_file" | "write_file" => panic!(
+                "Kernel codegen: `{}` is interpreter-only (dev-mode file I/O) -- there's no filesystem \
+                 in the C backend's target (a freestanding kernel booting under QEMU/real hardware), \
+                 so this can't be compiled. Use `kernel run` for programs that need it.",
+                name
+            ),
             "raw_write" => {
                 let addr = args.get(0).map(|a| self.call_arg(a, is_ptr, var_types)).unwrap_or_default();
                 let byte = args.get(1).map(|a| self.call_arg(a, is_ptr, var_types)).unwrap_or_default();

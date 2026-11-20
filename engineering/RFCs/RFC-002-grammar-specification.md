@@ -103,6 +103,28 @@ a silent miscompile.
   also a loud lift-time error, not silent. No recursive closures.
   Verified end to end including a real QEMU boot
   (`examples/closures_test.kn`).
+- **`len(x)`** -- works on both arrays (compiles to a literal constant,
+  the size is already known from the type, zero runtime cost) and
+  strings (byte length via a new `kernel_strlen` runtime helper, matching
+  Rust's `str::len()` exactly -- no Unicode-codepoint awareness in either
+  backend). Deliberately exempted from the checker's general move-
+  tracking for call arguments -- `len(my_array)` only reads the array to
+  report its size, it was never meant to consume ownership the way
+  passing a non-Copy value to an ordinary function does.
+- **File I/O** (`read_file(path) -> str`, `write_file(path, content)`) --
+  INTERPRETER-ONLY, dev-mode convenience. There is no filesystem at all
+  in the C backend's target (a freestanding kernel booting under
+  QEMU/real hardware), so `kernel build` rejects both with a clear error
+  naming the real reason, rather than silently emitting a call to an
+  undefined function that would only surface as a confusing linker error.
+  A real, named interpreter/codegen asymmetry, not every builtin needs
+  to exist on both backends -- but it must fail LOUDLY on the one it
+  doesn't.
+- **No module/import system yet** (`import` is a reserved keyword in the
+  lexer, unused by the parser) -- every program is a single file. A
+  package manager has nothing to manage until this exists, so it's
+  explicitly NOT started, named here rather than implied done just
+  because other Option C work (the LSP, these stdlib builtins) landed.
 
 ## Two run modes
 

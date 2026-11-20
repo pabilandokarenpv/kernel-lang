@@ -1,0 +1,5 @@
+fn main():
+    write_file("/tmp/kernel_file_io_test.txt", "hello from kernel")
+    let contents = read_file("/tmp/kernel_file_io_test.txt")
+    print(contents)
+    print(len(contents))

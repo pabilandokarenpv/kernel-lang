@@ -162,6 +162,19 @@ const char *kernel_strcat(const char *a, const char *b) {
     return buf;
 }
 
+/* Byte length of a null-terminated string -- there's no libc (and so no
+ * strlen) in this -ffreestanding environment, so Kernel's `len()` builtin
+ * (codegen_c.rs) needs its own. Matches the interpreter's `s.len()` (Rust
+ * byte length) exactly for any string this language can represent. */
+long kernel_strlen(const char *s) {
+    long n = 0;
+    while (*s) {
+        n++;
+        s++;
+    }
+    return n;
+}
+
 /* Halts the kernel after printing a message -- the only "abort" mechanism
  * available in a freestanding environment with no process/exit() concept.
  * Used by the C codegen backend's array bounds checks (see codegen_c.rs):

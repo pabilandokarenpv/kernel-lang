@@ -369,6 +369,62 @@ impl Interpreter {
                     };
                 }
             }
+            "len" => {
+                if let Some(CallArg::Positional(e)) = args.first() {
+                    let v = self.eval(e);
+                    return match v {
+                        Value::Array(items) => Value::Int(items.len() as i64),
+                        // Byte length, not Unicode codepoint count -- matches
+                        // the C codegen backend's kernel_strlen exactly
+                        // (strlen-style, no libc/Unicode awareness available
+                        // in a freestanding environment), so both backends
+                        // agree for any string this language can even
+                        // represent (ASCII-range source text).
+                        Value::Str(s) => Value::Int(s.len() as i64),
+                        other => panic!(
+                            "Kernel interpreter: len() only supports arrays and strings in v1.x, found {:?}",
+                            other
+                        ),
+                    };
+                }
+            }
+            // File I/O (v1.x): INTERPRETER-ONLY, dev-mode convenience --
+            // there is no filesystem at all in the C codegen backend's
+            // target (a freestanding kernel booting under QEMU/real
+            // hardware), so these two builtins have no meaning there and
+            // are rejected with a clear error at codegen time (see
+            // codegen_c.rs's call_expr) rather than silently emitting a
+            // call to a function that was never defined, which would only
+            // surface as a confusing LINKER error. A real, named
+            // interpreter/codegen asymmetry -- not every builtin needs to
+            // exist on both backends, but it must fail LOUDLY on the one
+            // it doesn't, never silently.
+            "read_file" => {
+                if let Some(CallArg::Positional(e)) = args.first() {
+                    let path = match self.eval(e) {
+                        Value::Str(s) => s,
+                        other => panic!("Kernel interpreter: read_file() expects a str path, found {:?}", other),
+                    };
+                    let contents = std::fs::read_to_string(&path)
+                        .unwrap_or_else(|err| panic!("Kernel interpreter: read_file(\"{}\") failed: {}", path, err));
+                    return Value::Str(contents);
+                }
+            }
+            "write_file" => {
+                if let (Some(CallArg::Positional(p)), Some(CallArg::Positional(c))) = (args.first(), args.get(1)) {
+                    let path = match self.eval(p) {
+                        Value::Str(s) => s,
+                        other => panic!("Kernel interpreter: write_file() expects a str path as its 1st argument, found {:?}", other),
+                    };
+                    let content = match self.eval(c) {
+                        Value::Str(s) => s,
+                        other => panic!("Kernel interpreter: write_file() expects a str content as its 2nd argument, found {:?}", other),
+                    };
+                    std::fs::write(&path, &content)
+                        .unwrap_or_else(|err| panic!("Kernel interpreter: write_file(\"{}\", ...) failed: {}", path, err));
+                    return Value::Unit;
+                }
+            }
             "raw_write" => {
                 // unsafe escape hatch: in the interpreter this just logs the
                 // intent, real MMIO happens in the compiled/kernel target.

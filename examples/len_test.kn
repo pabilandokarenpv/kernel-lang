@@ -1,0 +1,9 @@
+fn main():
+    let nums = [10, 20, 30, 40, 50]
+    print(len(nums))
+
+    let s = "hello world"
+    print(len(s))
+
+    let empty_s = ""
+    print(len(empty_s))

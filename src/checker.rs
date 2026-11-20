@@ -394,6 +394,23 @@ impl Checker {
                         fn_name, name
                     ));
                 }
+                // `len(x)` only ever reads `x` to report its size -- it
+                // never consumes ownership the way passing a non-Copy
+                // value to an ordinary function/struct-construction call
+                // does. Handled here, separately from the general move-
+                // tracking loop below, so `len(my_array)` doesn't force
+                // callers to write `len(&my_array)` just to avoid an
+                // unintended "move."
+                if name == "len" {
+                    for arg in args {
+                        let inner = match arg {
+                            CallArg::Positional(e) => e,
+                            CallArg::Named(_, e) => e,
+                        };
+                        self.check_expr(inner, scope, unsafe_ctx, fn_name);
+                    }
+                    return;
+                }
                 // Ephemeral borrows taken as THIS call's own arguments --
                 // live only for evaluating this one call, so conflicts are
                 // checked against each other (e.g. foo(&x, &mut x)) and

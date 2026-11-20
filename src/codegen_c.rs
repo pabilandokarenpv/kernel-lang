@@ -20,6 +20,21 @@
 use crate::ast::*;
 use std::collections::{HashMap, HashSet};
 
+// Parses a C array-type string built by `c_type` below, e.g. "long[5]" or
+// "struct Point[3]", back into (element C type, size). Array C types are
+// always exactly "<elem>[<N>]" (c_type never nests brackets -- v1.x has no
+// nested arrays), so a single rfind('[') is sufficient and unambiguous even
+// when <elem> is itself "struct Foo".
+fn array_info(c_ty: &str) -> Option<(String, i64)> {
+    let open = c_ty.rfind('[')?;
+    if !c_ty.ends_with(']') {
+        return None;
+    }
+    let elem = c_ty[..open].to_string();
+    let n: i64 = c_ty[open + 1..c_ty.len() - 1].parse().ok()?;
+    Some((elem, n))
+}
+
 pub struct Codegen {
     structs: HashSet<String>,
     functions: HashMap<String, FnDecl>,
@@ -54,7 +69,24 @@ impl Codegen {
     }
 
     fn c_type(&self, ty: &str) -> String {
-        match ty.trim_start_matches('&').trim() {
+        let trimmed = ty.trim_start_matches('&').trim();
+        // Array type `[ElemType;N]` (see ast.rs's Expr::ArrayLit doc
+        // comment) converts to the C "<elem>[<N>]" shape array_info expects
+        // -- note this is NOT valid as a bare declaration prefix (C needs
+        // `elem name[N]`, not `elem[N] name`); every call site that
+        // declares a name with this type (Stmt::Let, struct fields,
+        // fn_signature's params) special-cases it via array_info instead
+        // of blindly doing `{ty} {name}`.
+        if let Some(rest) = trimmed.strip_prefix('[') {
+            if let Some(end) = rest.rfind(';') {
+                if rest.ends_with(']') {
+                    let elem_ty = &rest[..end];
+                    let size_str = &rest[end + 1..rest.len() - 1];
+                    return format!("{}[{}]", self.c_type(elem_ty), size_str);
+                }
+            }
+        }
+        match trimmed {
             "int" => "long".to_string(),
             "float" => "double".to_string(),
             "str" => "const char*".to_string(),
@@ -114,8 +146,31 @@ impl Codegen {
                     .map(|kernel_ty| self.c_type(kernel_ty))
                     .unwrap_or_else(|| "long".to_string())
             }
+            Expr::ArrayLit(elems) => {
+                let elem_ty = elems
+                    .first()
+                    .map(|e| self.infer_c_type(e, var_types))
+                    .unwrap_or_else(|| "long".to_string());
+                format!("{}[{}]", elem_ty, elems.len())
+            }
+            Expr::Index(arr, _) => {
+                let arr_ty = self.infer_c_type(arr, var_types);
+                array_info(&arr_ty).map(|(elem, _)| elem).unwrap_or_else(|| "long".to_string())
+            }
             Expr::Ident(name) => var_types.get(name).cloned().unwrap_or_else(|| "long".to_string()),
-            Expr::Borrow(_, _) | Expr::Range(..) => "long".to_string(),
+            // A borrow's C type is a pointer to whatever's being borrowed
+            // (e.g. `&origin` where origin is `struct Point` -> "struct
+            // Point*") -- previously this always returned "long" regardless
+            // of the inner type, so a `let`-bound borrow like `let r1 =
+            // &origin` got mistyped, and a later `peek(r1)` call then
+            // passed that mistyped `long` where `peek`'s pointer parameter
+            // expected an actual pointer (a real, pre-existing bug, caught
+            // by batch-compiling every example through the C backend after
+            // adding arrays -- see examples/multi_shared_borrow_ok.kn,
+            // unrelated to arrays themselves but surfaced by the same
+            // "compile everything" sweep).
+            Expr::Borrow(inner, _) => format!("{}*", self.infer_c_type(inner, var_types)),
+            Expr::Range(..) => "long".to_string(),
             Expr::Call { name, args } => {
                 if name == "abs" {
                     return args.first().map(|a| match a {
@@ -149,14 +204,21 @@ impl Codegen {
         out.push_str("void kernel_print_newline(void);\n");
         out.push_str("long kernel_abs(long x);\n");
         out.push_str("double kernel_fabs(double x);\n");
-        out.push_str("const char *kernel_strcat(const char *a, const char *b);\n\n");
+        out.push_str("const char *kernel_strcat(const char *a, const char *b);\n");
+        out.push_str("_Noreturn void kernel_panic(const char *msg);\n\n");
 
         // struct definitions
         for item in &program.items {
             if let Item::Struct(s) = item {
                 out.push_str(&format!("struct {} {{\n", s.name));
                 for (fname, fty) in &s.fields {
-                    out.push_str(&format!("    {} {};\n", self.c_type(fty), fname));
+                    let c_ty = self.c_type(fty);
+                    // Array fields need C's "elem name[N]" declaration
+                    // order, not "elem[N] name" -- see c_type's doc comment.
+                    match array_info(&c_ty) {
+                        Some((elem, n)) => out.push_str(&format!("    {} {}[{}];\n", elem, fname, n)),
+                        None => out.push_str(&format!("    {} {};\n", c_ty, fname)),
+                    }
                 }
                 out.push_str("};\n\n");
             }
@@ -220,7 +282,23 @@ impl Codegen {
     fn fn_signature(&self, f: &FnDecl) -> String {
         let name = if f.name == "main" { "kmain".to_string() } else { f.name.clone() };
         let ret = match &f.return_ty {
-            Some(t) => self.c_type(t),
+            Some(t) => {
+                let c_ty = self.c_type(t);
+                if array_info(&c_ty).is_some() {
+                    // Plain C has no by-value array return (and no caller-
+                    // visible "borrow" to return either) -- fail loudly at
+                    // codegen time rather than emit invalid/misleading C.
+                    // Named v1.x gap: wrap the array in a struct, or take
+                    // an output array parameter, instead.
+                    panic!(
+                        "Kernel codegen: function `{}` returns an array type ({}) directly -- \
+                         not supported in the C backend for v1.x; wrap it in a struct or take \
+                         an output parameter instead",
+                        f.name, t
+                    );
+                }
+                c_ty
+            }
             None => "void".to_string(),
         };
         let params: Vec<String> = f
@@ -228,7 +306,14 @@ impl Codegen {
             .iter()
             .map(|p| {
                 let base = self.c_type(&p.ty);
-                if p.borrowed {
+                if let Some((elem, n)) = array_info(&base) {
+                    // Array parameters always decay to a pointer in C no
+                    // matter how they're declared -- so unlike scalar/
+                    // struct params there's no `borrowed` distinction to
+                    // render here; see ast.rs's Expr::ArrayLit doc comment
+                    // for why this is still sound at the Kernel level.
+                    format!("{} {}[{}]", elem, p.name, n)
+                } else if p.borrowed {
                     format!("{}* {}", base, p.name)
                 } else {
                     format!("{} {}", base, p.name)
@@ -291,6 +376,39 @@ impl Codegen {
             Expr::Field(obj, field) => {
                 format!("{}{}{}", self.expr(obj, is_ptr, var_types), self.accessor(obj, is_ptr), field)
             }
+            Expr::ArrayLit(elems) => {
+                // Bare C brace-init -- valid directly in a `let`/struct-
+                // field initializer position (the two call sites that
+                // special-case array declarations), invalid as a general
+                // expression; see ast.rs's Expr::ArrayLit doc comment for
+                // why that's an accepted v1.x rough edge rather than a
+                // Kernel-level check.
+                let rendered: Vec<String> = elems.iter().map(|e| self.expr(e, is_ptr, var_types)).collect();
+                format!("{{{}}}", rendered.join(", "))
+            }
+            Expr::Index(arr, idx) => {
+                let arr_ty = self.infer_c_type(arr, var_types);
+                let size = array_info(&arr_ty).map(|(_, n)| n);
+                let arr_c = self.expr(arr, is_ptr, var_types);
+                let idx_c = self.expr(idx, is_ptr, var_types);
+                match size {
+                    // Runtime bounds check via a GNU statement expression so
+                    // this can appear in any expression position, not just
+                    // a standalone statement -- halts via kernel_panic (see
+                    // runtime.c) on an out-of-range index instead of
+                    // reading/corrupting adjacent memory (the actual C
+                    // array-index UB this exists to prevent).
+                    Some(n) => format!(
+                        "({{ long __kn_idx = ({}); if (__kn_idx < 0 || __kn_idx >= {}) {{ kernel_panic(\"array index out of bounds\"); }} {}[__kn_idx]; }})",
+                        idx_c, n, arr_c
+                    ),
+                    None => panic!(
+                        "Kernel codegen: couldn't determine the array size for `{}[...]` to emit a bounds check -- \
+                         this indicates inference failed upstream (see infer_c_type), a real bug, not a silent skip",
+                        arr_c
+                    ),
+                }
+            }
             Expr::Borrow(inner, _exclusive) => format!("(&{})", self.expr(inner, is_ptr, var_types)),
             Expr::Call { name, args } => self.call_expr(name, args, is_ptr, var_types),
         }
@@ -332,10 +450,25 @@ impl Codegen {
     }
 
     fn call_arg(&self, a: &CallArg, is_ptr: &HashMap<String, bool>, var_types: &HashMap<String, String>) -> String {
-        match a {
-            CallArg::Positional(e) => self.expr(e, is_ptr, var_types),
-            CallArg::Named(_, e) => self.expr(e, is_ptr, var_types),
+        let e = match a {
+            CallArg::Positional(e) => e,
+            CallArg::Named(_, e) => e,
+        };
+        if let Expr::ArrayLit(elems) = e {
+            // Bare brace-init (what self.expr() renders for Expr::ArrayLit)
+            // is only valid C directly in a declaration/designated-field
+            // initializer -- a bare function-call ARGUMENT needs a C99
+            // compound-literal cast instead (`(long[]){1, 2, 3}`), which is
+            // valid in any general expression position and decays to the
+            // same pointer the callee's array parameter expects.
+            let elem_ty = elems
+                .first()
+                .map(|el| self.infer_c_type(el, var_types))
+                .unwrap_or_else(|| "long".to_string());
+            let rendered: Vec<String> = elems.iter().map(|el| self.expr(el, is_ptr, var_types)).collect();
+            return format!("({}[]){{{}}}", elem_ty, rendered.join(", "));
         }
+        self.expr(e, is_ptr, var_types)
     }
 
     fn indent(n: usize) -> String {
@@ -347,7 +480,16 @@ impl Codegen {
         match s {
             Stmt::Let { name, value, .. } => {
                 let ty = self.infer_c_type(value, var_types);
-                let rendered = format!("{}{} {} = {};\n", pad, ty, name, self.expr(value, is_ptr, var_types));
+                let rendered = match array_info(&ty) {
+                    // C array declarations put the size after the name
+                    // (`long name[5] = {...};`), not before it like every
+                    // other type -- see c_type's doc comment.
+                    Some((elem, n)) => format!(
+                        "{}{} {}[{}] = {};\n",
+                        pad, elem, name, n, self.expr(value, is_ptr, var_types)
+                    ),
+                    None => format!("{}{} {} = {};\n", pad, ty, name, self.expr(value, is_ptr, var_types)),
+                };
                 var_types.insert(name.clone(), ty);
                 rendered
             }
@@ -375,6 +517,23 @@ impl Codegen {
                     self.expr(object, is_ptr, var_types),
                     self.accessor(object, is_ptr),
                     field,
+                    self.expr(value, is_ptr, var_types)
+                )
+            }
+            Stmt::IndexAssign { array, index, value } => {
+                let arr_ty = self.infer_c_type(array, var_types);
+                let size = array_info(&arr_ty).map(|(_, n)| n).unwrap_or_else(|| {
+                    panic!(
+                        "Kernel codegen: couldn't determine the array size for an indexed assignment -- \
+                         this indicates inference failed upstream (see infer_c_type), a real bug, not a silent skip"
+                    )
+                });
+                format!(
+                    "{}{{ long __kn_idx = ({}); if (__kn_idx < 0 || __kn_idx >= {}) {{ kernel_panic(\"array index out of bounds\"); }} {}[__kn_idx] = {}; }}\n",
+                    pad,
+                    self.expr(index, is_ptr, var_types),
+                    size,
+                    self.expr(array, is_ptr, var_types),
                     self.expr(value, is_ptr, var_types)
                 )
             }

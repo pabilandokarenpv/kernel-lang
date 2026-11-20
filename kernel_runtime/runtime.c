@@ -161,3 +161,22 @@ const char *kernel_strcat(const char *a, const char *b) {
     buf[i] = '\0';
     return buf;
 }
+
+/* Halts the kernel after printing a message -- the only "abort" mechanism
+ * available in a freestanding environment with no process/exit() concept.
+ * Used by the C codegen backend's array bounds checks (see codegen_c.rs):
+ * an out-of-range index is a real safety violation, so this stops execution
+ * instead of reading/writing adjacent memory (the actual undefined
+ * behavior this exists to prevent). Mirrors boot.s's own `hang:` loop so
+ * there's exactly one halt idiom in the whole runtime. Marked `_Noreturn`
+ * (declared that way in the generated C too) so callers like the bounds-
+ * check statement-expression type-check correctly even though this never
+ * produces a value. */
+_Noreturn void kernel_panic(const char *msg) {
+    kernel_print_str("PANIC: ");
+    kernel_print_str(msg);
+    kernel_print_newline();
+    for (;;) {
+        __asm__ volatile ("cli; hlt");
+    }
+}

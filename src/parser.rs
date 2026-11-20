@@ -92,15 +92,24 @@ impl Parser {
                     }
                 }
                 Token::LBracket => {
-                    s.push('[');
-                    self.advance();
-                }
-                Token::RBracket => {
-                    s.push(']');
-                    self.advance();
-                    if depth == 0 {
-                        break;
-                    }
+                    // Array type `[ElemType;N]` -- self-contained (element
+                    // type can itself be any type string, e.g. a struct
+                    // name) and always terminal in v1.x: no nested arrays.
+                    // Reached either as the whole type (`[int;5]`) or after
+                    // the Amp branch above already pushed '&' (`&[int;5]`).
+                    self.advance(); // consume '['
+                    let elem_ty = self.parse_type();
+                    self.expect(Token::Semicolon);
+                    let size = match self.advance() {
+                        Token::Int(n) => n,
+                        other => panic!(
+                            "Kernel parser: expected an integer array size after `;` in an array type, found {:?}",
+                            other
+                        ),
+                    };
+                    self.expect(Token::RBracket);
+                    s.push_str(&format!("[{};{}]", elem_ty, size));
+                    break;
                 }
                 _ => break,
             }
@@ -494,6 +503,12 @@ impl Parser {
                                 }
                                 Stmt::FieldAssign { object: *obj, field, value }
                             }
+                            Expr::Index(array, index) => {
+                                if op != AssignOp::Set {
+                                    panic!("Kernel parser: compound assignment on array indices not supported in v1.x");
+                                }
+                                Stmt::IndexAssign { array: *array, index: *index, value }
+                            }
                             other => panic!("Kernel parser: invalid assignment target {:?}", other),
                         }
                     }
@@ -625,6 +640,10 @@ impl Parser {
             if self.eat(&Token::Dot) {
                 let field = self.ident();
                 expr = Expr::Field(Box::new(expr), field);
+            } else if self.eat(&Token::LBracket) {
+                let index = self.parse_expr();
+                self.expect(Token::RBracket);
+                expr = Expr::Index(Box::new(expr), Box::new(index));
             } else {
                 break;
             }
@@ -643,6 +662,19 @@ impl Parser {
                 let e = self.parse_expr();
                 self.expect(Token::RParen);
                 e
+            }
+            Token::LBracket => {
+                // Array literal `[e1, e2, ...]` -- see ast.rs's Expr::ArrayLit
+                // doc comment for v1.x's fixed-size-only scope.
+                let mut elems = Vec::new();
+                while !self.check(&Token::RBracket) {
+                    elems.push(self.parse_expr());
+                    if !self.eat(&Token::Comma) {
+                        break;
+                    }
+                }
+                self.expect(Token::RBracket);
+                Expr::ArrayLit(elems)
             }
             Token::Ident(name) => {
                 if self.check(&Token::LParen) {

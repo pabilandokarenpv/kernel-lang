@@ -78,6 +78,18 @@ a silent miscompile.
   the C backend, a separate pre-existing gap) rather than a silent
   miscompile. Scrutinee must be a plain ident/field access (re-evaluated
   per arm, so no call-expression scrutinee).
+- **Fixed-size arrays** (`[int;5]`, literals `[1, 2, 3]`, indexing
+  `arr[i]`/`arr[i] = v`). No dynamic-length slices/Vec yet (a real future
+  lift: fat pointer + length, heap/arena allocation). Bounds-checked at
+  RUNTIME in both backends -- the interpreter panics safely (Rust-level),
+  the C backend emits an inline check that halts via a new freestanding
+  `kernel_panic` (see `kernel_runtime/runtime.c`) rather than reading/
+  writing adjacent memory; verified end to end including in a real QEMU
+  boot (`examples/arrays_test.kn`, `examples/oob_panic_demo.kn`). Move/
+  borrow semantics mirror struct construction. Array function parameters
+  always decay to a C pointer (arrays can't be passed by value in C) and
+  array return types are rejected at codegen time with a clear error
+  (wrap in a struct instead) -- both named, not silent, limitations.
 
 ## Two run modes
 

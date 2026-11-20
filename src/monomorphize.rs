@@ -182,6 +182,11 @@ impl Monomorphizer {
             Expr::Borrow(inner, _) => self.infer_expr_type(inner, var_types),
             Expr::Unary(_, inner) => self.infer_expr_type(inner, var_types),
             Expr::Binary(l, _, _) => self.infer_expr_type(l, var_types),
+            // Arrays aren't generic-type-aware in v1.x -- monomorphization
+            // never needs to resolve an array's element type, only whether
+            // a CALL/CONSTRUCTION argument's type matches a generic's sole
+            // type parameter, and an array literal/index is never that.
+            Expr::ArrayLit(_) | Expr::Index(..) => None,
             Expr::Call { name, .. } => {
                 if self.struct_field_types.contains_key(name) {
                     Some(name.clone())
@@ -223,6 +228,11 @@ impl Monomorphizer {
             Stmt::Assign { value, .. } => self.rewrite_expr(value, var_types),
             Stmt::FieldAssign { object, value, .. } => {
                 self.rewrite_expr(object, var_types);
+                self.rewrite_expr(value, var_types);
+            }
+            Stmt::IndexAssign { array, index, value } => {
+                self.rewrite_expr(array, var_types);
+                self.rewrite_expr(index, var_types);
                 self.rewrite_expr(value, var_types);
             }
             Stmt::If { arms, else_body } => {
@@ -267,6 +277,15 @@ impl Monomorphizer {
                 self.rewrite_expr(r, var_types);
             }
             Expr::Field(obj, _) => self.rewrite_expr(obj, var_types),
+            Expr::Index(arr, idx) => {
+                self.rewrite_expr(arr, var_types);
+                self.rewrite_expr(idx, var_types);
+            }
+            Expr::ArrayLit(elems) => {
+                for e in elems.iter_mut() {
+                    self.rewrite_expr(e, var_types);
+                }
+            }
             Expr::Borrow(inner, _) => self.rewrite_expr(inner, var_types),
             Expr::Call { name, args } => {
                 for arg in args.iter_mut() {

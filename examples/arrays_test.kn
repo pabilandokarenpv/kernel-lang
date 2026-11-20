@@ -1,0 +1,21 @@
+struct Triangle:
+    sides: [int;3]
+
+fn sum3(arr: [int;3]) -> int:
+    return arr[0] + arr[1] + arr[2]
+
+fn main():
+    let nums = [10, 20, 30, 40, 50]
+    print(nums[0])
+    print(nums[4])
+
+    let mut counters = [0, 0, 0]
+    counters[1] = 99
+    print(counters[0])
+    print(counters[1])
+    print(counters[2])
+
+    let t = Triangle(sides: [3, 4, 5])
+    print(t.sides[2])
+
+    print(sum3([1, 2, 3]))

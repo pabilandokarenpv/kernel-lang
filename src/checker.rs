@@ -49,6 +49,14 @@
 use crate::ast::*;
 use std::collections::{HashMap, HashSet};
 
+// `[ElemType;N]` array types are a plain string ("[int;5]") in the AST, same
+// representation structs/primitives use -- this is the one place that needs
+// to recognize that shape to classify an array as a non-Copy (move-tracked)
+// type, same treatment as a struct.
+fn is_array_type(ty: &str) -> bool {
+    ty.starts_with('[')
+}
+
 #[derive(Debug, Clone)]
 struct VarState {
     copy: bool,
@@ -91,7 +99,7 @@ impl Checker {
             if let Item::Function(f) = item {
                 let mut scope: HashMap<String, VarState> = HashMap::new();
                 for p in &f.params {
-                    let copy = p.borrowed || !self.structs.contains(&p.ty);
+                    let copy = p.borrowed || (!self.structs.contains(&p.ty) && !is_array_type(&p.ty));
                     scope.insert(p.name.clone(), VarState { copy, moved: false, shared_borrows: 0, exclusive_borrow: false });
                 }
                 let mark = self.borrow_stack.len();
@@ -106,13 +114,17 @@ impl Checker {
         match expr {
             Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) => true,
             Expr::Ident(name) => scope.get(name).map(|s| s.copy).unwrap_or(true),
-            Expr::Binary(..) | Expr::Unary(..) | Expr::Field(..) | Expr::Borrow(..) | Expr::Range(..) => true,
+            Expr::Binary(..) | Expr::Unary(..) | Expr::Field(..) | Expr::Borrow(..) | Expr::Range(..) | Expr::Index(..) => true,
+            // A fresh array literal is a newly-constructed owned compound
+            // value, same treatment as struct construction below -- moving
+            // it moves the whole array, matching real ownership semantics.
+            Expr::ArrayLit(_) => false,
             Expr::Call { name, .. } => {
                 if self.structs.contains(name) {
                     false
                 } else if let Some(f) = self.functions.get(name) {
                     match &f.return_ty {
-                        Some(t) if self.structs.contains(t) => false,
+                        Some(t) if self.structs.contains(t) || is_array_type(t) => false,
                         _ => true,
                     }
                 } else {
@@ -203,6 +215,11 @@ impl Checker {
             }
             Stmt::FieldAssign { object, value, .. } => {
                 self.check_expr(object, scope, unsafe_ctx, fn_name);
+                self.check_expr(value, scope, unsafe_ctx, fn_name);
+            }
+            Stmt::IndexAssign { array, index, value } => {
+                self.check_expr(array, scope, unsafe_ctx, fn_name);
+                self.check_expr(index, scope, unsafe_ctx, fn_name);
                 self.check_expr(value, scope, unsafe_ctx, fn_name);
             }
             Stmt::If { arms, else_body } => {
@@ -353,6 +370,15 @@ impl Checker {
                 self.check_expr(r, scope, unsafe_ctx, fn_name);
             }
             Expr::Field(obj, _) => self.check_expr(obj, scope, unsafe_ctx, fn_name),
+            Expr::Index(arr, idx) => {
+                self.check_expr(arr, scope, unsafe_ctx, fn_name);
+                self.check_expr(idx, scope, unsafe_ctx, fn_name);
+            }
+            Expr::ArrayLit(elems) => {
+                for e in elems {
+                    self.check_expr(e, scope, unsafe_ctx, fn_name);
+                }
+            }
             Expr::Borrow(inner, _exclusive) => {
                 // A bare borrow expression outside a call-argument or `let`
                 // position (both handled specially below/in check_stmt) --

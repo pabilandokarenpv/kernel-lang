@@ -16,6 +16,7 @@ pub enum Value {
     Str(String),
     Bool(bool),
     Struct(String, HashMap<String, Value>),
+    Array(Vec<Value>),
     Unit,
 }
 
@@ -44,6 +45,22 @@ impl fmt::Display for Value {
                 write!(f, ")")
             }
             Value::Unit => write!(f, "()"),
+            // Not used by `print()` -- eval_call's "print" builtin rejects a
+            // whole-array argument loudly (see its own comment) so both
+            // backends stay consistent, since the C codegen backend has no
+            // generic array-printing support. Still implemented here for
+            // Debug/completeness (e.g. a future caller formatting one for
+            // diagnostics), matching standard array-literal notation.
+            Value::Array(items) => {
+                write!(f, "[")?;
+                for (i, v) in items.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", v)?;
+                }
+                write!(f, "]")
+            }
         }
     }
 }
@@ -176,6 +193,29 @@ impl Interpreter {
                 }
                 Flow::Normal
             }
+            Stmt::IndexAssign { array, index, value } => {
+                // v1.x restricts the indexed target to a plain ident (same
+                // scope boundary FieldAssign already has above) -- fails
+                // loudly instead of silently no-op'ing like FieldAssign's
+                // existing non-ident case does, since this is new surface
+                // area and the project's own convention is to fail loud.
+                let Expr::Ident(arr_name) = array else {
+                    panic!("Kernel interpreter: `arr[i] = value` requires `arr` to be a plain variable in v1.x, found {:?}", array);
+                };
+                let i = as_int(&self.eval(index));
+                let v = self.eval(value);
+                let mut arr_val = self.get_var(arr_name);
+                if let Value::Array(ref mut items) = arr_val {
+                    if i < 0 || i as usize >= items.len() {
+                        panic!("Kernel interpreter: array index {} out of bounds (len {})", i, items.len());
+                    }
+                    items[i as usize] = v;
+                } else {
+                    panic!("Kernel interpreter: indexed assignment on a non-array value");
+                }
+                self.set_var(arr_name, arr_val);
+                Flow::Normal
+            }
             Stmt::If { arms, else_body } => {
                 for (cond, body) in arms {
                     if truthy(&self.eval(cond)) {
@@ -272,6 +312,20 @@ impl Interpreter {
                 }
             }
             Expr::Borrow(e, _exclusive) => self.eval(e), // interpreter doesn't model aliasing, just the value
+            Expr::ArrayLit(elems) => Value::Array(elems.iter().map(|e| self.eval(e)).collect()),
+            Expr::Index(arr, idx) => {
+                let base = self.eval(arr);
+                let i = as_int(&self.eval(idx));
+                match base {
+                    Value::Array(items) => {
+                        if i < 0 || i as usize >= items.len() {
+                            panic!("Kernel interpreter: array index {} out of bounds (len {})", i, items.len());
+                        }
+                        items[i as usize].clone()
+                    }
+                    other => panic!("Kernel interpreter: indexing into a non-array value {:?}", other),
+                }
+            }
             Expr::Call { name, args } => self.eval_call(name, args),
         }
     }
@@ -282,9 +336,23 @@ impl Interpreter {
             "print" => {
                 let parts: Vec<String> = args
                     .iter()
-                    .map(|a| match a {
-                        CallArg::Positional(e) => self.eval(e).to_string(),
-                        CallArg::Named(_, e) => self.eval(e).to_string(),
+                    .map(|a| {
+                        let e = match a {
+                            CallArg::Positional(e) => e,
+                            CallArg::Named(_, e) => e,
+                        };
+                        let v = self.eval(e);
+                        // Matches the C codegen backend's restriction (see
+                        // print_stmt in codegen_c.rs): printing a WHOLE
+                        // array isn't supported there (no generic
+                        // array-formatter in the freestanding runtime), so
+                        // the interpreter rejects it too rather than
+                        // silently diverging between the two backends --
+                        // index into it (`print(arr[i])`) instead.
+                        if matches!(v, Value::Array(_)) {
+                            panic!("Kernel interpreter: `print()` on a whole array isn't supported in v1.x (matches the C codegen backend's restriction) -- index into it, e.g. `print(arr[0])`");
+                        }
+                        v.to_string()
                     })
                     .collect();
                 self.output.push(parts.join(" "));

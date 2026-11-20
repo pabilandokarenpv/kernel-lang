@@ -65,6 +65,7 @@ pub enum Token {
     LBracket,
     RBracket,
     LAngle,     // < used generically for generics is reused from Lt/Gt
+    Semicolon,  // ; used only inside array types/literals: [int;5]
 
     // structure
     Newline,
@@ -345,6 +346,7 @@ impl Lexer {
             ')' => Token::RParen,
             '[' => Token::LBracket,
             ']' => Token::RBracket,
+            ';' => Token::Semicolon,
             other => panic!("Kernel lexer: unexpected character '{}' at pos {}", other, self.pos),
         })
     }

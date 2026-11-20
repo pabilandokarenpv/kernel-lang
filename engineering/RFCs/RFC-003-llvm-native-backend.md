@@ -63,6 +63,13 @@ examples run unchanged, the rest are the named gaps below):
   call site), `abs` (manual `select`-based implementation, no libm
   dependency), and `len()` (a compile-time constant for arrays, real
   libc `strlen` for strings).
+- `read_file`/`write_file`: REAL file I/O via libc stdio (`fopen`/
+  `fseek`/`ftell`/`rewind`/`fread`/`fwrite`/`fclose`) -- a genuine
+  backend-specific CAPABILITY DIFFERENCE from `codegen_c.rs`, not a
+  cross-backend disagreement: the C backend's freestanding kernel
+  target has no filesystem at all (so it still rejects both outright),
+  while this backend targets a normal OS process that does. A failed
+  `fopen` is a clear panic, never a silent NULL dereference.
 - Top-level `static`/`const` (including desugared enum variants) as real
   LLVM globals.
 - REAL short-circuit `&&`/`||` (actual branching + a phi, not a simple
@@ -90,8 +97,6 @@ NOT yet supported -- every one of these is REJECTED with a clear, named
 error at codegen time (never a silent miscompile or a confusing linker
 error), same "fail loud" convention as every other gap in this project:
 
-- `read_file`/`write_file` -- interpreter-only dev convenience; `kernel
-  run` is the right tool for programs that need them.
 - `unsafe`/`raw_write` (MMIO) -- meaningless on a normal userspace
   process; `kernel build` (the freestanding C backend) is the right tool.
 - Cross-compilation -- this always targets the HOST's own triple.

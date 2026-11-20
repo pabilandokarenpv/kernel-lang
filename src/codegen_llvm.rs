@@ -38,12 +38,21 @@
 //     dependency needed for something this simple), and `len()` (a
 //     compile-time constant for arrays, real libc `strlen` for
 //     strings).
-//   - NOT YET: `read_file`/`write_file` (interpreter-only dev
-//     convenience), `raw_write`/`unsafe` (meaningless here -- there's
-//     no MMIO on a normal userspace process). Both REJECTED with a
-//     clear, named error at codegen time rather than silently
-//     miscompiled or silently dropped -- same "fail loud, name the
-//     gap" convention as every other backend in this project.
+//   - `read_file`/`write_file`: REAL file I/O via libc stdio
+//     (fopen/fseek/ftell/rewind/fread/fwrite/fclose) -- this backend
+//     targets a normal OS process with a real filesystem, unlike
+//     codegen_c.rs's freestanding kernel target (no filesystem at all,
+//     which is why that backend still rejects both outright; this is a
+//     genuine backend-specific capability difference, not a cross-
+//     backend disagreement, since the C backend's target literally
+//     cannot have a filesystem). A failed `fopen` (bad path,
+//     permissions) is a clear panic (see gen_null_check), never a
+//     silent NULL dereference.
+//   - NOT YET: `raw_write`/`unsafe` (meaningless here -- there's no
+//     MMIO on a normal userspace process). REJECTED with a clear, named
+//     error at codegen time rather than silently miscompiled or
+//     silently dropped -- same "fail loud, name the gap" convention as
+//     every other backend in this project.
 //   - Global `static`/`const` items ARE supported (straightforward LLVM
 //     global variables).
 //   - Real short-circuit `&&`/`||` (via actual branching + a phi, not a
@@ -134,6 +143,18 @@ impl<'ctx> LlvmCodegen<'ctx> {
         module.add_function("strcat", ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false), None);
         module.add_function("puts", i32_ty.fn_type(&[ptr_ty.into()], false), None);
         module.add_function("exit", context.void_type().fn_type(&[i32_ty.into()], false), None);
+        // Real libc stdio, for read_file/write_file -- this backend
+        // targets a normal OS process with a real filesystem, unlike
+        // codegen_c.rs's freestanding kernel target (no filesystem at
+        // all, hence that backend rejects both outright). See
+        // gen_call's "read_file"/"write_file" cases.
+        module.add_function("fopen", ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false), None);
+        module.add_function("fclose", i32_ty.fn_type(&[ptr_ty.into()], false), None);
+        module.add_function("fseek", i32_ty.fn_type(&[ptr_ty.into(), i64_ty.into(), i32_ty.into()], false), None);
+        module.add_function("ftell", i64_ty.fn_type(&[ptr_ty.into()], false), None);
+        module.add_function("rewind", context.void_type().fn_type(&[ptr_ty.into()], false), None);
+        module.add_function("fread", i64_ty.fn_type(&[ptr_ty.into(), i64_ty.into(), i64_ty.into(), ptr_ty.into()], false), None);
+        module.add_function("fwrite", i64_ty.fn_type(&[ptr_ty.into(), i64_ty.into(), i64_ty.into(), ptr_ty.into()], false), None);
         LlvmCodegen {
             context,
             module,
@@ -275,6 +296,18 @@ impl<'ctx> LlvmCodegen<'ctx> {
             Expr::Call { name, args } => {
                 if name == "abs" {
                     return args.first().map(|a| self.infer_kernel_type(arg_expr(a), ctx)).unwrap_or_else(|| "int".to_string());
+                }
+                if name == "read_file" {
+                    // A builtin, not a user Function -- doesn't go
+                    // through the `self.functions.get(name)` lookup
+                    // below at all, so it needs its own case here or it
+                    // silently falls through to the "int" default
+                    // (caught for real: `len(read_file(...))` crashed
+                    // with "len() only supports arrays and strings...
+                    // found a `int`" the first time this builtin's
+                    // result was ever fed into another type-sensitive
+                    // call, not just printed directly).
+                    return "str".to_string();
                 }
                 if self.structs.contains(name) {
                     name.clone()
@@ -627,6 +660,79 @@ impl<'ctx> LlvmCodegen<'ctx> {
         self.builder.build_unreachable().unwrap();
     }
 
+    // Branches to a panic (see gen_panic) if `ptr` is NULL, otherwise
+    // falls through -- shared by read_file/write_file's fopen() result,
+    // since a failed fopen (bad path, permissions, etc.) returning NULL
+    // and getting silently dereferenced anyway would be a real crash,
+    // not a clear Kernel-level error.
+    fn gen_null_check(&self, ptr: PointerValue<'ctx>, msg: &str, ctx: &FnCtx<'ctx>) {
+        let is_null = self.builder.build_is_null(ptr, "isnull").unwrap();
+        let ok_bb = self.context.append_basic_block(ctx.function, "notnull");
+        let panic_bb = self.context.append_basic_block(ctx.function, "isnull_panic");
+        self.builder.build_conditional_branch(is_null, panic_bb, ok_bb).unwrap();
+        self.builder.position_at_end(panic_bb);
+        self.gen_panic(msg);
+        self.builder.position_at_end(ok_bb);
+    }
+
+    // read_file(path) -> str -- real file I/O via libc stdio, since this
+    // backend targets a normal OS process with a real filesystem (unlike
+    // codegen_c.rs's freestanding kernel target, which has none at all
+    // and rejects both builtins outright). Reads the WHOLE file into one
+    // malloc'd, NUL-terminated buffer: fopen -> fseek to the end -> ftell
+    // for the size -> rewind -> malloc(size+1) -> fread -> manually write
+    // the NUL terminator (fread doesn't null-terminate on its own) ->
+    // fclose. Like gen_concat's allocations, this buffer is never freed
+    // (no GC/arena in v1.x of either backend) -- a named memory-leak gap,
+    // not a silent one.
+    fn gen_read_file(&self, path: PointerValue<'ctx>, ctx: &FnCtx<'ctx>) -> PointerValue<'ctx> {
+        let fopen_fn = self.module.get_function("fopen").unwrap();
+        let fseek_fn = self.module.get_function("fseek").unwrap();
+        let ftell_fn = self.module.get_function("ftell").unwrap();
+        let rewind_fn = self.module.get_function("rewind").unwrap();
+        let fread_fn = self.module.get_function("fread").unwrap();
+        let fclose_fn = self.module.get_function("fclose").unwrap();
+        let malloc_fn = self.module.get_function("malloc").unwrap();
+
+        let mode = self.builder.build_global_string_ptr("r", "read_mode").unwrap().as_pointer_value();
+        let file = self.builder.build_call(fopen_fn, &[path.into(), mode.into()], "file").unwrap().try_as_basic_value().basic().unwrap().into_pointer_value();
+        self.gen_null_check(file, "Kernel panic: read_file() could not open the file", ctx);
+
+        let i32_ty = self.context.i32_type();
+        let i64_ty = self.context.i64_type();
+        let seek_end = i32_ty.const_int(2, false); // SEEK_END
+        self.builder.build_call(fseek_fn, &[file.into(), i64_ty.const_zero().into(), seek_end.into()], "seek_end").unwrap();
+        let size = self.builder.build_call(ftell_fn, &[file.into()], "size").unwrap().try_as_basic_value().basic().unwrap().into_int_value();
+        self.builder.build_call(rewind_fn, &[file.into()], "rewind_call").unwrap();
+
+        let size_plus_nul = self.builder.build_int_add(size, i64_ty.const_int(1, false), "size_nul").unwrap();
+        let buf = self.builder.build_call(malloc_fn, &[size_plus_nul.into()], "readbuf").unwrap().try_as_basic_value().basic().unwrap().into_pointer_value();
+        self.builder.build_call(fread_fn, &[buf.into(), i64_ty.const_int(1, false).into(), size.into(), file.into()], "fread_call").unwrap();
+
+        let nul_ptr = unsafe { self.builder.build_gep(self.context.i8_type(), buf, &[size], "nul_ptr").unwrap() };
+        self.builder.build_store(nul_ptr, self.context.i8_type().const_zero()).unwrap();
+
+        self.builder.build_call(fclose_fn, &[file.into()], "fclose_call").unwrap();
+        buf
+    }
+
+    // write_file(path, content) -- the write twin of gen_read_file.
+    fn gen_write_file(&self, path: PointerValue<'ctx>, content: PointerValue<'ctx>, ctx: &FnCtx<'ctx>) {
+        let fopen_fn = self.module.get_function("fopen").unwrap();
+        let fwrite_fn = self.module.get_function("fwrite").unwrap();
+        let fclose_fn = self.module.get_function("fclose").unwrap();
+        let strlen_fn = self.module.get_function("strlen").unwrap();
+
+        let mode = self.builder.build_global_string_ptr("w", "write_mode").unwrap().as_pointer_value();
+        let file = self.builder.build_call(fopen_fn, &[path.into(), mode.into()], "file").unwrap().try_as_basic_value().basic().unwrap().into_pointer_value();
+        self.gen_null_check(file, "Kernel panic: write_file() could not open the file", ctx);
+
+        let len = self.builder.build_call(strlen_fn, &[content.into()], "content_len").unwrap().try_as_basic_value().basic().unwrap().into_int_value();
+        let i64_ty = self.context.i64_type();
+        self.builder.build_call(fwrite_fn, &[content.into(), i64_ty.const_int(1, false).into(), len.into(), file.into()], "fwrite_call").unwrap();
+        self.builder.build_call(fclose_fn, &[file.into()], "fclose_call").unwrap();
+    }
+
     fn gen_expr(&self, e: &Expr, ctx: &FnCtx<'ctx>) -> BasicValueEnum<'ctx> {
         match e {
             Expr::Int(n) => self.context.i64_type().const_int(*n as u64, true).into(),
@@ -848,14 +954,22 @@ impl<'ctx> LlvmCodegen<'ctx> {
                     panic!("Kernel LLVM codegen: len() only supports arrays and strings in v1.x, found a `{}`", ty);
                 }
             }
-            "read_file" | "write_file" | "raw_write" => panic!(
-                "Kernel LLVM codegen: `{}` isn't supported in the LLVM backend yet -- {}",
-                name,
-                match name {
-                    "read_file" | "write_file" => "file I/O is interpreter-only (dev-mode); `kernel run` is the right tool for it",
-                    "raw_write" => "there's no MMIO on a normal userspace process -- this only makes sense for the freestanding C backend",
-                    _ => unreachable!(),
-                }
+            "read_file" => {
+                let path_expr = arg_expr(args.first().unwrap_or_else(|| panic!("Kernel LLVM codegen: read_file() requires exactly one argument")));
+                let path = self.gen_expr(path_expr, ctx).into_pointer_value();
+                self.gen_read_file(path, ctx).into()
+            }
+            "write_file" => {
+                let path_expr = arg_expr(args.first().unwrap_or_else(|| panic!("Kernel LLVM codegen: write_file() requires a path and content argument")));
+                let content_expr = arg_expr(args.get(1).unwrap_or_else(|| panic!("Kernel LLVM codegen: write_file() requires a path and content argument")));
+                let path = self.gen_expr(path_expr, ctx).into_pointer_value();
+                let content = self.gen_expr(content_expr, ctx).into_pointer_value();
+                self.gen_write_file(path, content, ctx);
+                self.context.i64_type().const_zero().into() // Unit -- discarded, see gen_stmt's Stmt::Expr
+            }
+            "raw_write" => panic!(
+                "Kernel LLVM codegen: `raw_write` isn't supported in the LLVM backend -- there's no MMIO \
+                 on a normal userspace process -- this only makes sense for the freestanding C backend"
             ),
             _ if self.structs.contains(name) => {
                 let struct_ty = self.struct_types[name];

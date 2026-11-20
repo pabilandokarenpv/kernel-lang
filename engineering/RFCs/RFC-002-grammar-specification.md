@@ -63,6 +63,22 @@ generics/traits/enums/pattern-matching/closures for corpus-generator
 variety (see ARD-001). Attempting to use them is a parse/check error, not
 a silent miscompile.
 
+## v1.x additions since v1 (see ARD-001's "known, documented gap" note)
+
+- **Generics** (`fn identity<T>(...)`, `struct Box<T>: ...`) via a
+  monomorphization pass between parsing and checking (`monomorphize.rs`):
+  one concrete, mangled copy generated per distinct type actually used at
+  a call site. Single type parameter inferred; a second parameter in
+  `fn pair<T, U>` parses but isn't substituted yet (named future work).
+- **`match`** desugars entirely to `if`/`elif`/`else` at parse time (same
+  "erase the feature before the checker/interpreter/codegen see it"
+  approach as C-style enums below). v1.x patterns are int/bool literals
+  or bare idents (enum consts) only, no destructuring/guards/or-patterns;
+  string patterns are a parse error (`==` on `str` is pointer-equality in
+  the C backend, a separate pre-existing gap) rather than a silent
+  miscompile. Scrutinee must be a plain ident/field access (re-evaluated
+  per arm, so no call-expression scrutinee).
+
 ## Two run modes
 
 | Command | Path | Purpose |

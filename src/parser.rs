@@ -305,6 +305,105 @@ impl Parser {
         stmts
     }
 
+    // `match` (v1.x) desugars entirely to Stmt::If at parse time -- same
+    // "erase via AST-to-AST pass" philosophy as C-style enum desugaring
+    // above, just done inline here instead of a separate pass, since the
+    // target (If) already exists and needs zero changes to the
+    // checker/interpreter/codegen. Each arm becomes `scrutinee == pattern`;
+    // `_` becomes the else branch.
+    //
+    // Honest v1.x scope (named gaps, not silent ones):
+    //   - Patterns are int/bool literals or bare idents (e.g. enum consts)
+    //     only -- no destructuring, no struct/array patterns, no guards,
+    //     no or-patterns (`a | b`).
+    //   - String literal patterns are rejected with a clear parse error:
+    //     `==` on `str` is still POINTER equality in the C codegen backend
+    //     (a separate, pre-existing gap -- see codegen_c.rs's `binop`,
+    //     which emits plain C `==` for every type), so a string pattern
+    //     would silently miscompile there. Flagged as a named follow-up,
+    //     not fixed as part of this feature.
+    //   - The scrutinee must be a plain identifier or field access (not a
+    //     general expression) because it's cloned into every arm's
+    //     condition and re-evaluated per arm tested -- a call expression
+    //     would silently run once per arm. Fails loudly instead at parse
+    //     time if the scrutinee isn't one of those two safe shapes.
+    fn parse_match_desugared(&mut self) -> Stmt {
+        self.expect(Token::Match);
+        let scrutinee = self.parse_expr();
+        if !matches!(scrutinee, Expr::Ident(_) | Expr::Field(..)) {
+            panic!(
+                "Kernel parser: `match` scrutinee must be a plain variable or field access in v1.x \
+                 (it's re-evaluated once per arm) -- bind it to a `let` first, found {:?}",
+                scrutinee
+            );
+        }
+        self.expect(Token::Colon);
+        self.expect(Token::Newline);
+        self.expect(Token::Indent);
+
+        let mut arms = Vec::new();
+        let mut else_body = None;
+        loop {
+            self.skip_newlines();
+            if self.check(&Token::Dedent) || self.check(&Token::Eof) {
+                break;
+            }
+            let is_wildcard = matches!(self.cur(), Token::Ident(n) if n == "_");
+            if is_wildcard {
+                self.advance();
+                self.expect(Token::Colon);
+                else_body = Some(self.parse_block());
+            } else {
+                let pattern = self.parse_match_pattern();
+                self.expect(Token::Colon);
+                let body = self.parse_block();
+                let cond = Expr::Binary(Box::new(scrutinee.clone()), BinOp::Eq, Box::new(pattern));
+                arms.push((cond, body));
+            }
+            self.skip_newlines();
+        }
+        self.expect(Token::Dedent);
+        Stmt::If { arms, else_body }
+    }
+
+    fn parse_match_pattern(&mut self) -> Expr {
+        match self.cur().clone() {
+            Token::Int(n) => {
+                self.advance();
+                Expr::Int(n)
+            }
+            Token::Minus => {
+                self.advance();
+                match self.advance() {
+                    Token::Int(n) => Expr::Int(-n),
+                    other => panic!("Kernel parser: expected an int literal after `-` in a match pattern, found {:?}", other),
+                }
+            }
+            Token::True => {
+                self.advance();
+                Expr::Bool(true)
+            }
+            Token::False => {
+                self.advance();
+                Expr::Bool(false)
+            }
+            Token::Ident(name) => {
+                self.advance();
+                Expr::Ident(name)
+            }
+            Token::Str(_) => panic!(
+                "Kernel parser: string literal patterns in `match` aren't supported yet -- \
+                 see parse_match_desugared's doc comment (C codegen's `==` is pointer-equality \
+                 for `str`); use an `if`/`elif` chain with string comparisons directly for now."
+            ),
+            other => panic!(
+                "Kernel parser: unsupported `match` pattern {:?} -- v1.x supports int/bool \
+                 literals and bare identifiers (e.g. enum constants) only",
+                other
+            ),
+        }
+    }
+
     fn parse_stmt(&mut self) -> Stmt {
         match self.cur().clone() {
             Token::Let => {
@@ -374,6 +473,7 @@ impl Parser {
                 self.expect(Token::Colon);
                 Stmt::Unsafe(self.parse_block())
             }
+            Token::Match => self.parse_match_desugared(),
             _ => {
                 // assignment or expression statement; parse an expr first
                 let expr = self.parse_expr();

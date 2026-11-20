@@ -9,20 +9,41 @@
 // a genuinely different target, not just a faster way to build the same
 // one.
 //
-// Honest v1.x scope for this first slice (named gaps, not silent ones):
+// Honest v1.x scope for this backend (named gaps, not silent ones):
 //   - Functions, structs, if/elif/else, while, for-in-range, return,
 //     int/float/bool/str, borrows (&T / &mut T, same scope as
 //     codegen_c.rs: field access through a BORROWED PARAMETER works,
 //     field access through a locally `let`-bound borrow does not --
 //     matching, not improving on, the C backend's existing limit).
-//   - `print` (via real libc printf) and `abs` (manual select, no libm
-//     dependency needed for something this simple).
-//   - NOT YET: arrays, string concatenation (`+`/`+=` on str), `len()`,
-//     `read_file`/`write_file`, `raw_write`/`unsafe` (meaningless here --
-//     there's no MMIO on a normal userspace process). Every one of these
-//     is REJECTED with a clear, named error at codegen time rather than
-//     silently miscompiled or silently dropped -- same "fail loud, name
-//     the gap" convention as every other backend in this project.
+//   - Fixed-size arrays (`[T;N]`): literals, indexing (read/write,
+//     runtime-bounds-checked -- an out-of-range index calls real libc
+//     `puts`+`exit(1)`, see gen_bounds_check/gen_panic, the native
+//     twin of codegen_c.rs's kernel_panic halt), struct fields, and
+//     function params (ALWAYS decay to a pointer, matching C/
+//     codegen_c.rs exactly, since that's the only way C can pass one
+//     either). Returning an array BY VALUE is still rejected (same
+//     reason codegen_c.rs rejects it too: no sound by-value array
+//     return in C's ABI model, and no caller-visible "borrow" to
+//     return instead).
+//   - String concatenation (`+`/`+=` on `str`): REAL heap allocation
+//     via libc `malloc`/`strcpy`/`strcat` (see gen_concat) -- unlike
+//     codegen_c.rs's kernel_strcat, which writes into a bounded
+//     rotating pool of static buffers because there's no malloc/heap
+//     at all in a -ffreestanding environment. Correct for any length,
+//     no truncation, no "an older still-live result gets silently
+//     overwritten" risk -- the real tradeoff the other way: nothing is
+//     ever freed (no GC/arena in v1.x of EITHER backend), a named
+//     memory-leak gap, not a silent one.
+//   - `print` (via real libc printf), `abs` (manual select, no libm
+//     dependency needed for something this simple), and `len()` (a
+//     compile-time constant for arrays, real libc `strlen` for
+//     strings).
+//   - NOT YET: `read_file`/`write_file` (interpreter-only dev
+//     convenience), `raw_write`/`unsafe` (meaningless here -- there's
+//     no MMIO on a normal userspace process). Both REJECTED with a
+//     clear, named error at codegen time rather than silently
+//     miscompiled or silently dropped -- same "fail loud, name the
+//     gap" convention as every other backend in this project.
 //   - Global `static`/`const` items ARE supported (straightforward LLVM
 //     global variables).
 //   - Real short-circuit `&&`/`||` (via actual branching + a phi, not a
@@ -42,6 +63,22 @@ use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, FunctionValue, Poi
 use inkwell::{AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel};
 use std::collections::HashMap;
 use std::path::Path;
+
+// Parses a Kernel array type string `[ElemType;N]` into (element Kernel
+// type, N) -- the LLVM-backend twin of codegen_c.rs's array_info, same
+// shape, operating on Kernel-level type strings directly rather than
+// already-converted C ones. A single rfind(';') is sufficient and
+// unambiguous for the same reason codegen_c.rs's array_info's is: v1.x
+// has no nested arrays, so ElemType itself never contains a `;`.
+fn kernel_array_info(ty: &str) -> Option<(String, i64)> {
+    let trimmed = ty.trim();
+    let rest = trimmed.strip_prefix('[')?;
+    let rest = rest.strip_suffix(']')?;
+    let semi = rest.rfind(';')?;
+    let elem = rest[..semi].to_string();
+    let n: i64 = rest[semi + 1..].parse().ok()?;
+    Some((elem, n))
+}
 
 struct FnCtx<'ctx> {
     function: FunctionValue<'ctx>,
@@ -82,8 +119,21 @@ impl<'ctx> LlvmCodegen<'ctx> {
         let module = context.create_module(module_name);
         let builder = context.create_builder();
         let ptr_ty = context.ptr_type(AddressSpace::default());
-        let printf_ty = context.i32_type().fn_type(&[ptr_ty.into()], true);
+        let i64_ty = context.i64_type();
+        let i32_ty = context.i32_type();
+        let printf_ty = i32_ty.fn_type(&[ptr_ty.into()], true);
         let printf_fn = module.add_function("printf", printf_ty, None);
+        // Real libc, since this backend targets a normal userspace
+        // process (unlike codegen_c.rs's -ffreestanding target, which
+        // hand-rolls everything down to kernel_strcat/kernel_panic
+        // because there's no libc at all) -- see gen_concat/
+        // gen_bounds_check_or_panic for what each of these backs.
+        module.add_function("strlen", i64_ty.fn_type(&[ptr_ty.into()], false), None);
+        module.add_function("malloc", ptr_ty.fn_type(&[i64_ty.into()], false), None);
+        module.add_function("strcpy", ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false), None);
+        module.add_function("strcat", ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false), None);
+        module.add_function("puts", i32_ty.fn_type(&[ptr_ty.into()], false), None);
+        module.add_function("exit", context.void_type().fn_type(&[i32_ty.into()], false), None);
         LlvmCodegen {
             context,
             module,
@@ -125,16 +175,11 @@ impl<'ctx> LlvmCodegen<'ctx> {
             .unwrap_or_else(|| "int".to_string())
     }
 
-    // Kernel type string -> LLVM type. Arrays are a named, explicit gap
-    // (see this module's doc comment) -- panics rather than guessing.
+    // Kernel type string -> LLVM type.
     fn llvm_type(&self, ty: &str) -> BasicTypeEnum<'ctx> {
         let trimmed = ty.trim_start_matches('&').trim();
-        if trimmed.starts_with('[') {
-            panic!(
-                "Kernel LLVM codegen: fixed-size arrays aren't supported in the LLVM backend yet \
-                 (type `{}`) -- use `kernel build` (the C/freestanding backend) for programs that need them",
-                ty
-            );
+        if let Some((elem_ty, n)) = kernel_array_info(trimmed) {
+            return self.llvm_type(&elem_ty).array_type(n as u32).into();
         }
         match trimmed {
             "int" => self.context.i64_type().into(),
@@ -147,9 +192,14 @@ impl<'ctx> LlvmCodegen<'ctx> {
     }
 
     // A function parameter/return's LLVM type: a borrowed type (&T) is
-    // always a bare pointer, regardless of what it points to.
+    // always a bare pointer regardless of what it points to, and a FIXED-
+    // SIZE ARRAY ALWAYS decays to a bare pointer too (borrowed or not --
+    // matching codegen_c.rs's "array parameters always decay to a
+    // pointer in C no matter how they're declared" exactly, since C has
+    // no other way to pass one either).
     fn llvm_type_for_decl(&self, ty: &str) -> BasicTypeEnum<'ctx> {
-        if ty.trim_start_matches('&').trim() != ty.trim() && ty.starts_with('&') {
+        let trimmed = ty.trim_start_matches('&').trim();
+        if kernel_array_info(trimmed).is_some() || ty.starts_with('&') {
             self.ptr_type().into()
         } else {
             self.llvm_type(ty)
@@ -234,10 +284,14 @@ impl<'ctx> LlvmCodegen<'ctx> {
                     "int".to_string()
                 }
             }
-            Expr::ArrayLit(_) | Expr::Index(..) => panic!(
-                "Kernel LLVM codegen: fixed-size arrays aren't supported in the LLVM backend yet -- \
-                 use `kernel build` (the C/freestanding backend) for programs that need them"
-            ),
+            Expr::ArrayLit(elems) => {
+                let elem_ty = elems.first().map(|e| self.infer_kernel_type(e, ctx)).unwrap_or_else(|| "int".to_string());
+                format!("[{};{}]", elem_ty, elems.len())
+            }
+            Expr::Index(arr, _) => {
+                let arr_ty = self.infer_kernel_type(arr, ctx);
+                kernel_array_info(&arr_ty).map(|(e, _)| e).unwrap_or_else(|| "int".to_string())
+            }
             Expr::Range(..) => panic!("Kernel LLVM codegen: a range is only valid as a for-loop iterator"),
             Expr::Closure { .. } => unreachable!("Kernel LLVM codegen: Expr::Closure should always be erased by lambda_lift.rs before codegen runs"),
         }
@@ -348,6 +402,19 @@ impl<'ctx> LlvmCodegen<'ctx> {
             self.module.add_function("main", fn_type, None);
             return;
         }
+        if let Some(t) = &f.return_ty {
+            if kernel_array_info(t.trim_start_matches('&')).is_some() {
+                // Plain LLVM has no sound by-value array return any more
+                // than plain C does (and no caller-visible "borrow" to
+                // return either) -- same named v1.x gap as
+                // codegen_c.rs's fn_signature, for the same reason.
+                panic!(
+                    "Kernel LLVM codegen: function `{}` returns an array type ({}) directly -- \
+                     not supported; wrap it in a struct or take an output parameter instead",
+                    f.name, t
+                );
+            }
+        }
         let fn_type = match &f.return_ty {
             Some(t) => self.llvm_type_for_decl(t).fn_type(&param_types, false),
             None => self.context.void_type().fn_type(&param_types, false),
@@ -356,7 +423,7 @@ impl<'ctx> LlvmCodegen<'ctx> {
     }
 
     fn param_llvm_type(&self, p: &Param) -> BasicTypeEnum<'ctx> {
-        if p.borrowed {
+        if p.borrowed || kernel_array_info(&p.ty).is_some() {
             self.ptr_type().into()
         } else {
             self.llvm_type(&p.ty)
@@ -375,8 +442,16 @@ impl<'ctx> LlvmCodegen<'ctx> {
             let alloca = self.builder.build_alloca(self.param_llvm_type(p), &p.name).unwrap();
             self.builder.build_store(alloca, llvm_param).unwrap();
             ctx.vars.insert(p.name.clone(), alloca);
-            ctx.var_types.insert(p.name.clone(), if p.borrowed { format!("&{}", p.ty) } else { p.ty.clone() });
-            ctx.is_ptr.insert(p.name.clone(), p.borrowed);
+            // Arrays decay to a pointer regardless of `&` (matching
+            // codegen_c.rs) -- so an array param's Kernel type string is
+            // stored UNPREFIXED (just "[int;3]", never "&[int;3]") even
+            // though its underlying storage is just as pointer-typed as a
+            // borrowed param's; is_ptr is what actually drives the
+            // deref-on-access decision for both cases uniformly (see
+            // array_base_ptr/struct_base_ptr).
+            let is_array = kernel_array_info(&p.ty).is_some();
+            ctx.var_types.insert(p.name.clone(), if p.borrowed && !is_array { format!("&{}", p.ty) } else { p.ty.clone() });
+            ctx.is_ptr.insert(p.name.clone(), p.borrowed || is_array);
         }
 
         for stmt in &f.body {
@@ -426,11 +501,9 @@ impl<'ctx> LlvmCodegen<'ctx> {
         self.builder.get_insert_block().and_then(|b| b.get_terminator()).is_some()
     }
 
-    // The ADDRESS of a "place" expression (an ident, or a field chain
-    // rooted in one) -- used for Stmt::Let's target isn't needed (lets
-    // always create a fresh alloca), but IS needed for FieldAssign,
-    // IndexAssign's base (arrays aren't supported yet so N/A), and
-    // Expr::Borrow (`&x` is exactly "the address of x").
+    // The ADDRESS of a "place" expression (an ident, or a field/index
+    // chain rooted in one) -- used for FieldAssign/IndexAssign's target,
+    // and Expr::Borrow (`&x` is exactly "the address of x").
     fn gen_addr(&self, e: &Expr, ctx: &FnCtx<'ctx>) -> PointerValue<'ctx> {
         match e {
             Expr::Ident(name) => self.var_addr(name, ctx),
@@ -445,10 +518,11 @@ impl<'ctx> LlvmCodegen<'ctx> {
                 let struct_ty = self.struct_types[&struct_name];
                 self.builder.build_struct_gep(struct_ty, base_ptr, idx, "fieldaddr").unwrap()
             }
+            Expr::Index(arr, idx) => self.array_elem_addr(arr, idx, ctx).0,
             Expr::Borrow(inner, _) => self.gen_addr(inner, ctx),
             other => panic!(
-                "Kernel LLVM codegen: `{:?}` isn't a supported place expression in v1.x (only identifiers \
-                 and field accesses rooted in one)",
+                "Kernel LLVM codegen: `{:?}` isn't a supported place expression in v1.x (only identifiers, \
+                 field accesses, and array indexing, rooted in one)",
                 other
             ),
         }
@@ -473,6 +547,86 @@ impl<'ctx> LlvmCodegen<'ctx> {
         }
     }
 
+    // The address of the FIRST ELEMENT an array expression's base refers
+    // to -- the array-indexing twin of struct_base_ptr. A local array
+    // variable's own alloca already IS this address (an array's first
+    // element starts at its own base address); a decayed array PARAMETER
+    // (always is_ptr -- see FnCtx::is_ptr's doc comment) needs one load
+    // to get at the pointer value it was passed as, exactly like a
+    // borrowed struct parameter does.
+    fn array_base_ptr(&self, arr: &Expr, ctx: &FnCtx<'ctx>) -> PointerValue<'ctx> {
+        match arr {
+            Expr::Ident(name) => {
+                let addr = self.var_addr(name, ctx);
+                if *ctx.is_ptr.get(name).unwrap_or(&false) {
+                    self.builder.build_load(self.ptr_type(), addr, "arrderef").unwrap().into_pointer_value()
+                } else {
+                    addr
+                }
+            }
+            Expr::Field(..) => self.gen_addr(arr, ctx), // a struct field that's itself an array -- its field address IS its base pointer
+            Expr::Borrow(inner, _) => self.gen_addr(inner, ctx),
+            other => panic!("Kernel LLVM codegen: `{:?}` isn't a supported array base expression in v1.x", other),
+        }
+    }
+
+    // Computes the bounds-checked ADDRESS of `arr[idx]`, plus the
+    // element's Kernel type -- shared by Expr::Index (read) and
+    // Stmt::IndexAssign (write) so the bounds check can never be
+    // forgotten on one path but not the other. An out-of-range index
+    // calls `kernel_panic_native` (puts + exit(1)) and never falls
+    // through -- see this function's `unreachable` terminator -- matching
+    // codegen_c.rs's kernel_panic halt-on-OOB behavior, just via real
+    // libc instead of a hand-rolled freestanding routine.
+    fn array_elem_addr(&self, arr: &Expr, idx: &Expr, ctx: &FnCtx<'ctx>) -> (PointerValue<'ctx>, String) {
+        let arr_ty = self.infer_kernel_type(arr, ctx);
+        let (elem_ty, n) = kernel_array_info(&arr_ty).unwrap_or_else(|| {
+            panic!(
+                "Kernel LLVM codegen: couldn't determine the array size for `[...]` to emit a bounds \
+                 check -- this indicates inference failed upstream (see infer_kernel_type), a real bug, \
+                 not a silent skip"
+            )
+        });
+        let base_ptr = self.array_base_ptr(arr, ctx);
+        let idx_val = self.gen_expr(idx, ctx).into_int_value();
+        let checked_idx = self.gen_bounds_check(idx_val, n, ctx);
+        let elem_llvm_ty = self.llvm_type(&elem_ty);
+        let addr = unsafe { self.builder.build_gep(elem_llvm_ty, base_ptr, &[checked_idx], "idxaddr").unwrap() };
+        (addr, elem_ty)
+    }
+
+    fn gen_bounds_check(&self, idx: inkwell::values::IntValue<'ctx>, n: i64, ctx: &FnCtx<'ctx>) -> inkwell::values::IntValue<'ctx> {
+        let zero = self.context.i64_type().const_zero();
+        let n_val = self.context.i64_type().const_int(n as u64, false);
+        let ge_zero = self.builder.build_int_compare(IntPredicate::SGE, idx, zero, "ge0").unwrap();
+        let lt_n = self.builder.build_int_compare(IntPredicate::SLT, idx, n_val, "ltn").unwrap();
+        let in_bounds = self.builder.build_and(ge_zero, lt_n, "inbounds").unwrap();
+        let ok_bb = self.context.append_basic_block(ctx.function, "idx_ok");
+        let panic_bb = self.context.append_basic_block(ctx.function, "idx_panic");
+        self.builder.build_conditional_branch(in_bounds, ok_bb, panic_bb).unwrap();
+
+        self.builder.position_at_end(panic_bb);
+        self.gen_panic("Kernel panic: array index out of bounds");
+
+        self.builder.position_at_end(ok_bb);
+        idx
+    }
+
+    // Prints `msg` and terminates the process (exit code 1) -- real
+    // libc's `puts`+`exit`, never returns (ends the current basic block
+    // with `unreachable`, matching exit()'s real noreturn semantics, not
+    // just a convention). The native-backend equivalent of
+    // kernel_runtime/runtime.c's kernel_panic, just backed by a real OS
+    // process exit instead of a freestanding halt loop.
+    fn gen_panic(&self, msg: &str) {
+        let msg_ptr = self.builder.build_global_string_ptr(msg, "panicmsg").unwrap().as_pointer_value();
+        let puts_fn = self.module.get_function("puts").unwrap();
+        let exit_fn = self.module.get_function("exit").unwrap();
+        self.builder.build_call(puts_fn, &[msg_ptr.into()], "puts_call").unwrap();
+        self.builder.build_call(exit_fn, &[self.context.i32_type().const_int(1, false).into()], "exit_call").unwrap();
+        self.builder.build_unreachable().unwrap();
+    }
+
     fn gen_expr(&self, e: &Expr, ctx: &FnCtx<'ctx>) -> BasicValueEnum<'ctx> {
         match e {
             Expr::Int(n) => self.context.i64_type().const_int(*n as u64, true).into(),
@@ -482,16 +636,21 @@ impl<'ctx> LlvmCodegen<'ctx> {
             Expr::Ident(name) => {
                 let addr = self.var_addr(name, ctx);
                 let kernel_ty = self.var_kernel_type(name, ctx);
-                // A pointer-typed variable (a borrowed PARAMETER, or a
-                // locally `let`-bound borrow like `let r1 = &origin`)
-                // always has a `ptr`-typed alloca -- loading it with any
-                // other LLVM type (e.g. the pointee's struct type) would
-                // read the wrong number of bytes starting at the wrong
-                // place, not just produce the wrong VALUE (a real bug
-                // this exact check exists to prevent, caught by
-                // multi_shared_borrow_ok.kn printing a garbage pointer
-                // bit-pattern instead of 5 before this fix).
-                let llvm_ty = if kernel_ty.starts_with('&') { self.ptr_type().into() } else { self.llvm_type(&kernel_ty) };
+                // A pointer-typed variable (a borrowed PARAMETER, an
+                // ARRAY parameter -- always decayed, see is_ptr's doc
+                // comment -- or a locally `let`-bound borrow like `let
+                // r1 = &origin`) always has a `ptr`-typed alloca --
+                // loading it with any other LLVM type (e.g. the pointee's
+                // struct type) would read the wrong number of bytes
+                // starting at the wrong place, not just produce the
+                // wrong VALUE (a real bug this exact check exists to
+                // prevent, caught by multi_shared_borrow_ok.kn printing a
+                // garbage pointer bit-pattern instead of 5 before this
+                // fix). `is_ptr` alone would miss a LOCAL borrow (never
+                // tracked there, see FnCtx::is_ptr's doc comment), hence
+                // checking both.
+                let needs_ptr_load = kernel_ty.starts_with('&') || *ctx.is_ptr.get(name).unwrap_or(&false);
+                let llvm_ty = if needs_ptr_load { self.ptr_type().into() } else { self.llvm_type(&kernel_ty) };
                 self.builder.build_load(llvm_ty, addr, name).unwrap()
             }
             Expr::Unary(UnaryOp::Neg, inner) => {
@@ -511,10 +670,7 @@ impl<'ctx> LlvmCodegen<'ctx> {
             Expr::Binary(l, BinOp::Add, r)
                 if self.infer_kernel_type(l, ctx) == "str" && self.infer_kernel_type(r, ctx) == "str" =>
             {
-                panic!(
-                    "Kernel LLVM codegen: string concatenation (`+`) isn't supported in the LLVM backend yet \
-                     -- use `kernel build` (the C backend) or `kernel run` (the interpreter) for programs that need it"
-                );
+                self.gen_concat(l, r, ctx).into()
             }
             Expr::Binary(l, op, r) => self.gen_binop(l, *op, r, ctx),
             Expr::Field(..) => {
@@ -534,13 +690,53 @@ impl<'ctx> LlvmCodegen<'ctx> {
             }
             Expr::Borrow(_, _) => self.gen_addr(e, ctx).into(),
             Expr::Call { name, args } => self.gen_call(name, args, ctx),
-            Expr::ArrayLit(_) | Expr::Index(..) => panic!(
-                "Kernel LLVM codegen: fixed-size arrays aren't supported in the LLVM backend yet -- \
-                 use `kernel build` (the C/freestanding backend) for programs that need them"
-            ),
+            Expr::ArrayLit(elems) => {
+                let elem_ty = elems.first().map(|el| self.infer_kernel_type(el, ctx)).unwrap_or_else(|| "int".to_string());
+                let arr_llvm_ty = self.llvm_type(&elem_ty).array_type(elems.len() as u32);
+                let mut agg = arr_llvm_ty.get_undef();
+                for (i, el) in elems.iter().enumerate() {
+                    let val = self.gen_expr(el, ctx);
+                    agg = self.builder.build_insert_value(agg, val, i as u32, "arrayinit").unwrap().into_array_value();
+                }
+                agg.into()
+            }
+            Expr::Index(arr, idx) => {
+                let (addr, elem_ty) = self.array_elem_addr(arr, idx, ctx);
+                self.builder.build_load(self.llvm_type(&elem_ty), addr, "idxval").unwrap()
+            }
             Expr::Range(..) => panic!("Kernel LLVM codegen: a range is only valid as a for-loop iterator"),
             Expr::Closure { .. } => unreachable!("Kernel LLVM codegen: Expr::Closure should always be erased by lambda_lift.rs before codegen runs"),
         }
+    }
+
+    // `a + b` where both are `str` -- real heap allocation via libc
+    // malloc (unlike codegen_c.rs's kernel_strcat, which writes into a
+    // fixed-size rotating pool of static buffers because there's no
+    // malloc/heap in a -ffreestanding environment at all). Correctly
+    // handles any length with no truncation and no "an older still-live
+    // result gets silently overwritten" risk the rotating pool has --
+    // the real tradeoff the other direction: this never frees the
+    // allocation (no GC/arena exists in v1.x of EITHER backend), a named
+    // memory-leak gap, not a silent one.
+    fn gen_concat(&self, l: &Expr, r: &Expr, ctx: &FnCtx<'ctx>) -> PointerValue<'ctx> {
+        let a = self.gen_expr(l, ctx).into_pointer_value();
+        let b = self.gen_expr(r, ctx).into_pointer_value();
+        self.gen_concat_ptrs(a, b)
+    }
+
+    fn gen_concat_ptrs(&self, a: PointerValue<'ctx>, b: PointerValue<'ctx>) -> PointerValue<'ctx> {
+        let strlen_fn = self.module.get_function("strlen").unwrap();
+        let malloc_fn = self.module.get_function("malloc").unwrap();
+        let strcpy_fn = self.module.get_function("strcpy").unwrap();
+        let strcat_fn = self.module.get_function("strcat").unwrap();
+        let len_a = self.builder.build_call(strlen_fn, &[a.into()], "len_a").unwrap().try_as_basic_value().basic().unwrap().into_int_value();
+        let len_b = self.builder.build_call(strlen_fn, &[b.into()], "len_b").unwrap().try_as_basic_value().basic().unwrap().into_int_value();
+        let total = self.builder.build_int_add(len_a, len_b, "total_len").unwrap();
+        let total_plus_nul = self.builder.build_int_add(total, self.context.i64_type().const_int(1, false), "total_nul").unwrap();
+        let buf = self.builder.build_call(malloc_fn, &[total_plus_nul.into()], "concat_buf").unwrap().try_as_basic_value().basic().unwrap().into_pointer_value();
+        self.builder.build_call(strcpy_fn, &[buf.into(), a.into()], "strcpy_call").unwrap();
+        self.builder.build_call(strcat_fn, &[buf.into(), b.into()], "strcat_call").unwrap();
+        buf
     }
 
     fn gen_short_circuit(&self, l: &Expr, r: &Expr, ctx: &FnCtx<'ctx>, is_and: bool) -> inkwell::values::IntValue<'ctx> {
@@ -637,11 +833,25 @@ impl<'ctx> LlvmCodegen<'ctx> {
                     _ => panic!("Kernel LLVM codegen: abs() on a non-numeric value"),
                 }
             }
-            "len" | "read_file" | "write_file" | "raw_write" => panic!(
+            "len" => {
+                let e = arg_expr(args.first().unwrap_or_else(|| panic!("Kernel LLVM codegen: len() requires exactly one argument")));
+                let ty = self.infer_kernel_type(e, ctx);
+                if let Some((_, n)) = kernel_array_info(&ty) {
+                    // Compile-time-known constant, zero runtime cost --
+                    // matching codegen_c.rs's len() on arrays exactly.
+                    self.context.i64_type().const_int(n as u64, false).into()
+                } else if ty == "str" {
+                    let s = self.gen_expr(e, ctx);
+                    let strlen_fn = self.module.get_function("strlen").unwrap();
+                    self.builder.build_call(strlen_fn, &[s.into()], "strlen_call").unwrap().try_as_basic_value().basic().unwrap()
+                } else {
+                    panic!("Kernel LLVM codegen: len() only supports arrays and strings in v1.x, found a `{}`", ty);
+                }
+            }
+            "read_file" | "write_file" | "raw_write" => panic!(
                 "Kernel LLVM codegen: `{}` isn't supported in the LLVM backend yet -- {}",
                 name,
                 match name {
-                    "len" => "arrays/strings' len() needs the array/string support this backend doesn't have yet",
                     "read_file" | "write_file" => "file I/O is interpreter-only (dev-mode); `kernel run` is the right tool for it",
                     "raw_write" => "there's no MMIO on a normal userspace process -- this only makes sense for the freestanding C backend",
                     _ => unreachable!(),
@@ -677,10 +887,49 @@ impl<'ctx> LlvmCodegen<'ctx> {
                 // bug: for a plain Ident argument it would take the
                 // address of the ARGUMENT VARIABLE's own storage slot
                 // instead of the pointer VALUE already stored there.
-                let call_args: Vec<BasicMetadataValueEnum> = args.iter().map(|a| self.gen_expr(arg_expr(a), ctx).into()).collect();
+                //
+                // ARRAYS are the one real exception: they always decay to
+                // a pointer at the call site (matching codegen_c.rs),
+                // which gen_expr does NOT do on its own for a plain array
+                // Ident (that loads the FULL array VALUE, correct for
+                // e.g. a `let` but wrong for a call argument) -- so this
+                // is the one place argument codegen still has to look at
+                // the ARGUMENT'S OWN inferred type, not special-case the
+                // callee.
+                let call_args: Vec<BasicMetadataValueEnum> = args
+                    .iter()
+                    .map(|a| {
+                        let e = arg_expr(a);
+                        if kernel_array_info(&self.infer_kernel_type(e, ctx)).is_some() {
+                            self.array_arg_ptr(e, ctx).into()
+                        } else {
+                            self.gen_expr(e, ctx).into()
+                        }
+                    })
+                    .collect();
                 let result = self.builder.build_call(callee, &call_args, "call").unwrap();
                 result.try_as_basic_value().basic().unwrap_or_else(|| self.context.i64_type().const_zero().into())
             }
+        }
+    }
+
+    // A pointer to the FIRST ELEMENT of an array argument expression --
+    // either an existing array's base pointer (array_base_ptr), or, for a
+    // bare literal passed directly (`sum3([1, 2, 3])`), a fresh temporary
+    // alloca to give the freshly-built value an address at all. Mirrors
+    // codegen_c.rs's call_arg's C99 compound-literal-cast trick for
+    // exactly the same bare-array-literal-as-argument shape, just via a
+    // real temporary stack slot instead of a C expression-level cast.
+    fn array_arg_ptr(&self, e: &Expr, ctx: &FnCtx<'ctx>) -> PointerValue<'ctx> {
+        match e {
+            Expr::ArrayLit(_) => {
+                let kernel_ty = self.infer_kernel_type(e, ctx);
+                let val = self.gen_expr(e, ctx);
+                let alloca = self.builder.build_alloca(self.llvm_type(&kernel_ty), "arraylit_tmp").unwrap();
+                self.builder.build_store(alloca, val).unwrap();
+                alloca
+            }
+            _ => self.array_base_ptr(e, ctx),
         }
     }
 
@@ -702,6 +951,16 @@ impl<'ctx> LlvmCodegen<'ctx> {
                 let llvm_ty = self.llvm_type(&kernel_ty);
                 let new_val = match op {
                     AssignOp::Set => self.gen_expr(value, ctx),
+                    AssignOp::Add if kernel_ty == "str" => {
+                        // `msg += "more"` -- same real strcat-via-malloc
+                        // path as `+` (gen_concat), just reading the
+                        // current value back out of its own storage
+                        // first instead of taking it as an already-
+                        // evaluated operand.
+                        let cur = self.builder.build_load(llvm_ty, addr, "cur").unwrap().into_pointer_value();
+                        let rhs = self.gen_expr(value, ctx).into_pointer_value();
+                        self.gen_concat_ptrs(cur, rhs).into()
+                    }
                     AssignOp::Add | AssignOp::Sub => {
                         let cur = self.builder.build_load(llvm_ty, addr, "cur").unwrap();
                         let rhs = self.gen_expr(value, ctx);
@@ -726,10 +985,11 @@ impl<'ctx> LlvmCodegen<'ctx> {
                 let val = self.gen_expr(value, ctx);
                 self.builder.build_store(addr, val).unwrap();
             }
-            Stmt::IndexAssign { .. } => panic!(
-                "Kernel LLVM codegen: fixed-size arrays aren't supported in the LLVM backend yet -- \
-                 use `kernel build` (the C/freestanding backend) for programs that need them"
-            ),
+            Stmt::IndexAssign { array, index, value } => {
+                let (addr, _elem_ty) = self.array_elem_addr(array, index, ctx);
+                let val = self.gen_expr(value, ctx);
+                self.builder.build_store(addr, val).unwrap();
+            }
             Stmt::If { arms, else_body } => self.gen_if(arms, else_body, ctx),
             Stmt::While { cond, body } => self.gen_while(cond, body, ctx),
             Stmt::For { var, iter, body } => self.gen_for(var, iter, body, ctx),

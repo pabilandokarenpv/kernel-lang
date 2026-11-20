@@ -1,6 +1,6 @@
 # RFC-003: native LLVM backend — a real second target, not a second kernel
 
-**Status:** Implemented (v2, first slice)
+**Status:** Implemented (v2 -- arrays, string concatenation, and `len()` added in a second slice)
 
 ## Summary
 
@@ -35,25 +35,34 @@ project does. `inkwell` is a thin, safe wrapper over `llvm-sys`; LLVM 18
 itself (via `llvm-18-dev`, `libpolly-18-dev`, `libzstd-dev` on
 Debian/Ubuntu) is the actual dependency.
 
-## Honest v1.x scope for this first slice
+## Honest v1.x scope
 
 Supported, verified end to end (byte-for-byte output parity against the
-interpreter, confirmed across the full example suite -- 12/20 existing
+interpreter, confirmed across the full example suite -- 17/20 existing
 examples run unchanged, the rest are the named gaps below):
 
 - Functions (including recursion, forward calls -- two-pass declare/
   define, same reasoning as `codegen_c.rs`), `if`/`elif`/`else`, `while`,
   `for`-in-range, `return`.
 - `int`/`float`/`bool`/`str` (string literals, printing, passing as
-  args -- NOT concatenation, see below), structs (construction, field
+  args, and REAL concatenation -- `+`/`+=` -- via libc `malloc`/
+  `strcpy`/`strcat`, see "strings" below), structs (construction, field
   read/write, by-value params and returns, nested field access).
+- Fixed-size arrays (`[T;N]`): literals, indexing (read/write, runtime-
+  bounds-checked), struct fields, and function params (ALWAYS decay to
+  a pointer, matching `codegen_c.rs`/C exactly). An out-of-range index
+  calls real libc `puts`+`exit(1)` -- the native twin of
+  `kernel_runtime/runtime.c`'s `kernel_panic` halt, just via a real OS
+  process exit instead of a freestanding halt loop. Returning an array
+  BY VALUE is still rejected, same reason `codegen_c.rs` rejects it too.
 - Borrows (`&T`/`&mut T`) -- same scope as `codegen_c.rs`: field access
   through a borrowed PARAMETER works; field access through a locally
   `let`-bound borrow does not (an accepted limit carried over, not a new
   one -- see codegen_llvm.rs's FnCtx::is_ptr doc comment).
 - `print` (real libc `printf`, one dynamically-built format string per
-  call site) and `abs` (manual `select`-based implementation, no libm
-  dependency needed for something this simple).
+  call site), `abs` (manual `select`-based implementation, no libm
+  dependency), and `len()` (a compile-time constant for arrays, real
+  libc `strlen` for strings).
 - Top-level `static`/`const` (including desugared enum variants) as real
   LLVM globals.
 - REAL short-circuit `&&`/`||` (actual branching + a phi, not a simple
@@ -63,15 +72,24 @@ examples run unchanged, the rest are the named gaps below):
   exactly what this project's "backends must agree" discipline exists to
   catch before it ships.
 
+### Strings: a real design choice, not a smaller version of the C backend's
+
+`codegen_c.rs`'s `kernel_strcat` writes into a FIXED-SIZE rotating pool
+of static buffers (bounded length, bounded number of "alive" results at
+once) because a -ffreestanding kernel has no malloc/heap at all. This
+backend targets a normal OS process with a real heap, so `gen_concat`
+uses real `malloc`/`strcpy`/`strcat` instead: correct for any length, no
+truncation, no "an older still-live result gets silently overwritten"
+risk the rotating pool has. The real tradeoff the other direction:
+nothing allocated this way is ever freed (no GC/arena exists in v1.x of
+EITHER backend) -- a named memory-leak gap, not a silent one, and a
+strictly fair trade for a proof-of-concept compiler, not a production
+one.
+
 NOT yet supported -- every one of these is REJECTED with a clear, named
 error at codegen time (never a silent miscompile or a confusing linker
 error), same "fail loud" convention as every other gap in this project:
 
-- Fixed-size arrays (`[T;N]`) and `len()` on them -- real extra work
-  (GEP-based indexing, bounds-check branching) not done in this slice.
-- String concatenation (`+`/`+=` on `str`) -- needs a real allocation
-  story for a libc-backed target (malloc-based, unlike the freestanding
-  backend's rotating-buffer trick) that hasn't been designed yet.
 - `read_file`/`write_file` -- interpreter-only dev convenience; `kernel
   run` is the right tool for programs that need them.
 - `unsafe`/`raw_write` (MMIO) -- meaningless on a normal userspace
@@ -106,9 +124,12 @@ functions, global const/static, short-circuit booleans).
   ELF executable (`file` confirms: dynamically linked, not stripped),
   run DIRECTLY with no QEMU, exit code 0, stdout `15` -- matching the
   interpreter exactly.
-- Full example suite swept through `build-native`: 12 pass with exact
-  interpreter-parity output, 8 fail with the clear, named rejections
-  listed above -- zero silent wrong output anywhere.
-- `kernel build` (C/freestanding backend) re-verified unaffected (same
-  clean QEMU boot as before) -- this slice only adds a new backend, it
-  doesn't touch the existing one.
+- Full example suite swept through `build-native`: 17 pass with exact
+  interpreter-parity output (including `examples/arrays_test.kn`,
+  `examples/string_concat.kn`, and `examples/oob_panic_demo.kn` --
+  verified pixel-for-pixel equivalent halt behavior to the interpreter's
+  Rust panic, just via real libc `puts`+`exit(1)` instead), 3 fail with
+  the clear, named rejections above (`raw_write`/`unsafe`,
+  `read_file`/`write_file`) -- zero silent wrong output anywhere.
+- `kernel build` (C/freestanding backend) and the LSP both re-verified
+  unaffected after this slice too.

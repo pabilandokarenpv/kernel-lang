@@ -1,0 +1,17 @@
+fn main():
+    let mut vs: Vec<str> = vec_new()
+    vec_push(&mut vs, "hello")
+    vec_push(&mut vs, "world")
+    print(vec_get(vs, 0))
+    print(vec_get(vs, 1))
+
+    let mut vb: Vec<bool> = vec_new()
+    vec_push(&mut vb, true)
+    vec_push(&mut vb, false)
+    print(vec_get(vb, 0))
+    print(vec_get(vb, 1))
+
+    let mut vf: Vec<float> = vec_new()
+    vec_push(&mut vf, 1.5)
+    vec_set(&mut vf, 0, 2.5)
+    print(vec_get(vf, 0))

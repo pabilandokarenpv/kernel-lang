@@ -89,6 +89,17 @@ fn kernel_array_info(ty: &str) -> Option<(String, i64)> {
     Some((elem, n))
 }
 
+// Parses `Vec<ElemType>` -> `ElemType`. See Value::Vec's doc comment in
+// interpreter.rs for the full design -- this is the LLVM-backend half
+// of it (codegen only, scoped to primitive element types -- see
+// vec_elem_byte_size's panic for structs/arrays/nested Vecs).
+fn vec_elem_type(ty: &str) -> Option<String> {
+    let trimmed = ty.trim();
+    let rest = trimmed.strip_prefix("Vec<")?;
+    let rest = rest.strip_suffix('>')?;
+    Some(rest.trim().to_string())
+}
+
 struct FnCtx<'ctx> {
     function: FunctionValue<'ctx>,
     vars: HashMap<String, PointerValue<'ctx>>,
@@ -139,6 +150,11 @@ impl<'ctx> LlvmCodegen<'ctx> {
         // gen_bounds_check_or_panic for what each of these backs.
         module.add_function("strlen", i64_ty.fn_type(&[ptr_ty.into()], false), None);
         module.add_function("malloc", ptr_ty.fn_type(&[i64_ty.into()], false), None);
+        // Vec<T>'s growth (vec_push) -- realloc(NULL, n) is well-defined
+        // as equivalent to malloc(n), so this alone covers both the
+        // initial allocation (cap 0 -> N) and every later regrowth,
+        // without needing a separate malloc+memcpy+free sequence.
+        module.add_function("realloc", ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false), None);
         module.add_function("strcpy", ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false), None);
         module.add_function("strcat", ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false), None);
         module.add_function("puts", i32_ty.fn_type(&[ptr_ty.into()], false), None);
@@ -202,6 +218,15 @@ impl<'ctx> LlvmCodegen<'ctx> {
         if let Some((elem_ty, n)) = kernel_array_info(trimmed) {
             return self.llvm_type(&elem_ty).array_type(n as u32).into();
         }
+        if vec_elem_type(trimmed).is_some() {
+            // Same universal {data ptr, len, cap} layout regardless of
+            // the element type T -- LLVM pointers are opaque (no
+            // per-pointee-type distinction at the type level since
+            // LLVM 15+), so the struct's own shape never changes; only
+            // element LOADS/STORES/GEPs (see gen_call's vec_* arms) need
+            // T, via an explicit pointee type passed to each GEP.
+            return self.vec_struct_type().into();
+        }
         match trimmed {
             "int" => self.context.i64_type().into(),
             "float" => self.context.f64_type().into(),
@@ -209,6 +234,31 @@ impl<'ctx> LlvmCodegen<'ctx> {
             "str" => self.ptr_type().into(),
             other if self.struct_types.contains_key(other) => self.struct_types[other].into(),
             other => panic!("Kernel LLVM codegen: unknown type `{}`", other),
+        }
+    }
+
+    // `Vec<T>`'s universal runtime layout: { data: ptr, len: i64, cap: i64 }.
+    fn vec_struct_type(&self) -> inkwell::types::StructType<'ctx> {
+        self.context.struct_type(&[self.ptr_type().into(), self.context.i64_type().into(), self.context.i64_type().into()], false)
+    }
+
+    // Byte size of ONE element, for realloc's sizing in vec_push's
+    // growth path. Scoped to v1.x's primitive element types only --
+    // struct/array/nested-Vec elements would need a real sizeof
+    // computation (TargetData-based) that this backend doesn't have
+    // yet; named here as a real, honest gap rather than silently
+    // guessing a wrong size and corrupting the heap.
+    fn vec_elem_byte_size(&self, ty: &str) -> u64 {
+        match ty.trim() {
+            "int" | "float" => 8,
+            "bool" => 1,
+            "str" => 8, // a pointer
+            other => panic!(
+                "Kernel LLVM codegen: `Vec<{}>` isn't supported in v1.x -- only Vec<int>/Vec<float>/Vec<bool>/Vec<str> \
+                 (primitive element types) are, since sizing a struct/array/nested-Vec element for realloc needs a \
+                 real sizeof computation this backend doesn't have yet",
+                other
+            ),
         }
     }
 
@@ -308,6 +358,29 @@ impl<'ctx> LlvmCodegen<'ctx> {
                     // result was ever fed into another type-sensitive
                     // call, not just printed directly).
                     return "str".to_string();
+                }
+                if name == "vec_new" {
+                    panic!(
+                        "Kernel LLVM codegen: vec_new() can only appear directly as a `let`'s value (with an \
+                         explicit `: Vec<ElemType>` annotation) -- found it elsewhere, where there's no way to \
+                         know the element type"
+                    );
+                }
+                if name == "vec_len" {
+                    return "int".to_string();
+                }
+                if name == "vec_get" {
+                    let vec_ty = args.first().map(|a| self.infer_kernel_type(arg_expr(a), ctx)).unwrap_or_else(|| "int".to_string());
+                    let vec_ty = vec_ty.trim_start_matches('&').to_string();
+                    return vec_elem_type(&vec_ty).unwrap_or_else(|| "int".to_string());
+                }
+                if matches!(name.as_str(), "vec_push" | "vec_set") {
+                    // Unit, in effect -- these are only ever used as a
+                    // standalone Stmt::Expr (see gen_stmt), never as a
+                    // value, so this is never actually read; "int" is a
+                    // harmless placeholder, not a real guess being acted
+                    // on by anything.
+                    return "int".to_string();
                 }
                 if self.structs.contains(name) {
                     name.clone()
@@ -626,6 +699,101 @@ impl<'ctx> LlvmCodegen<'ctx> {
         let elem_llvm_ty = self.llvm_type(&elem_ty);
         let addr = unsafe { self.builder.build_gep(elem_llvm_ty, base_ptr, &[checked_idx], "idxaddr").unwrap() };
         (addr, elem_ty)
+    }
+
+    // Resolves a vec_push/vec_get/vec_len/vec_set call's first argument
+    // to (the Vec variable's storage ADDRESS, its element Kernel type)
+    // -- always via var_addr directly (never gen_expr/gen_addr's normal
+    // Borrow-dependent logic), because mutation needs the real address
+    // of the variable's OWN storage regardless of whether the caller
+    // wrote an explicit `&mut` or not (both are accepted -- see
+    // interpreter.rs's identical design/reasoning in eval_call's
+    // "vec_push" | "vec_set" arm).
+    fn vec_name_and_elem_ty(&self, e: &Expr, ctx: &FnCtx<'ctx>) -> (PointerValue<'ctx>, String) {
+        let unwrapped = match e {
+            Expr::Borrow(inner, _) => inner.as_ref(),
+            other => other,
+        };
+        let name = match unwrapped {
+            Expr::Ident(n) => n,
+            _ => panic!(
+                "Kernel LLVM codegen: a vec_push/vec_get/vec_len/vec_set call's first argument must be a \
+                 plain Vec variable name (optionally &mut-prefixed), not an arbitrary expression"
+            ),
+        };
+        let addr = self.var_addr(name, ctx);
+        let vty = self.var_kernel_type(name, ctx);
+        let elem_ty = vec_elem_type(vty.trim_start_matches('&'))
+            .unwrap_or_else(|| panic!("Kernel LLVM codegen: `{}` is not a Vec<T> (found type `{}`)", name, vty));
+        (addr, elem_ty)
+    }
+
+    // Same idea as gen_bounds_check, but against a RUNTIME length (a
+    // Vec's len field) rather than a compile-time-constant array size --
+    // arrays know their size from the type itself; Vecs don't.
+    fn gen_bounds_check_dynamic(&self, idx: inkwell::values::IntValue<'ctx>, len: inkwell::values::IntValue<'ctx>, ctx: &FnCtx<'ctx>) -> inkwell::values::IntValue<'ctx> {
+        let zero = self.context.i64_type().const_zero();
+        let ge_zero = self.builder.build_int_compare(IntPredicate::SGE, idx, zero, "ge0").unwrap();
+        let lt_len = self.builder.build_int_compare(IntPredicate::SLT, idx, len, "ltlen").unwrap();
+        let in_bounds = self.builder.build_and(ge_zero, lt_len, "inbounds").unwrap();
+        let ok_bb = self.context.append_basic_block(ctx.function, "vecidx_ok");
+        let panic_bb = self.context.append_basic_block(ctx.function, "vecidx_panic");
+        self.builder.build_conditional_branch(in_bounds, ok_bb, panic_bb).unwrap();
+
+        self.builder.position_at_end(panic_bb);
+        self.gen_panic("Kernel panic: Vec index out of bounds");
+
+        self.builder.position_at_end(ok_bb);
+        idx
+    }
+
+    // vec_push's full grow-if-needed-then-append logic. Growth
+    // (len==cap) reallocs via realloc(old_data, new_cap*elem_size) --
+    // well-defined as malloc-equivalent when old_data is NULL (cap 0),
+    // so there's no separate first-allocation special case. The
+    // reallocated buffer is NEVER freed on drop (no destructors/GC/arena
+    // in v1.x of either backend -- a named leak, not a silent one, same
+    // as gen_concat's string allocations).
+    fn gen_vec_push(&self, addr: PointerValue<'ctx>, elem_ty: &str, val: BasicValueEnum<'ctx>, ctx: &FnCtx<'ctx>) {
+        let vec_ty = self.vec_struct_type();
+        let i64_ty = self.context.i64_type();
+        let data_field = self.builder.build_struct_gep(vec_ty, addr, 0, "datafield").unwrap();
+        let len_field = self.builder.build_struct_gep(vec_ty, addr, 1, "lenfield").unwrap();
+        let cap_field = self.builder.build_struct_gep(vec_ty, addr, 2, "capfield").unwrap();
+
+        let len = self.builder.build_load(i64_ty, len_field, "len").unwrap().into_int_value();
+        let cap = self.builder.build_load(i64_ty, cap_field, "cap").unwrap().into_int_value();
+        let needs_grow = self.builder.build_int_compare(IntPredicate::EQ, len, cap, "needsgrow").unwrap();
+
+        let grow_bb = self.context.append_basic_block(ctx.function, "vec_grow");
+        let after_bb = self.context.append_basic_block(ctx.function, "vec_grow_done");
+        self.builder.build_conditional_branch(needs_grow, grow_bb, after_bb).unwrap();
+
+        self.builder.position_at_end(grow_bb);
+        let cap_is_zero = self.builder.build_int_compare(IntPredicate::EQ, cap, i64_ty.const_zero(), "capzero").unwrap();
+        let doubled = self.builder.build_int_mul(cap, i64_ty.const_int(2, false), "doubled").unwrap();
+        let new_cap = self.builder.build_select(cap_is_zero, i64_ty.const_int(4, false), doubled, "newcap").unwrap().into_int_value();
+        let elem_size = i64_ty.const_int(self.vec_elem_byte_size(elem_ty), false);
+        let new_size = self.builder.build_int_mul(new_cap, elem_size, "newsize").unwrap();
+        let old_data = self.builder.build_load(self.ptr_type(), data_field, "olddata").unwrap().into_pointer_value();
+        let realloc_fn = self.module.get_function("realloc").unwrap();
+        let new_data = self.builder.build_call(realloc_fn, &[old_data.into(), new_size.into()], "newdata").unwrap().try_as_basic_value().basic().unwrap().into_pointer_value();
+        self.gen_null_check(new_data, "Kernel panic: vec_push() allocation failed", ctx);
+        self.builder.build_store(data_field, new_data).unwrap();
+        self.builder.build_store(cap_field, new_cap).unwrap();
+        self.builder.build_unconditional_branch(after_bb).unwrap();
+
+        self.builder.position_at_end(after_bb);
+        // Reload data (may have just changed in grow_bb) rather than
+        // carrying the old SSA value across the branch -- simpler and
+        // correct even though it costs one extra load on the no-grow
+        // path.
+        let data = self.builder.build_load(self.ptr_type(), data_field, "data").unwrap().into_pointer_value();
+        let elem_llvm_ty = self.llvm_type(elem_ty);
+        let elem_addr = unsafe { self.builder.build_gep(elem_llvm_ty, data, &[len], "newelem").unwrap() };
+        self.builder.build_store(elem_addr, val).unwrap();
+        let new_len = self.builder.build_int_add(len, i64_ty.const_int(1, false), "newlen").unwrap();
+        self.builder.build_store(len_field, new_len).unwrap();
     }
 
     fn gen_bounds_check(&self, idx: inkwell::values::IntValue<'ctx>, n: i64, ctx: &FnCtx<'ctx>) -> inkwell::values::IntValue<'ctx> {
@@ -971,13 +1139,48 @@ impl<'ctx> LlvmCodegen<'ctx> {
                 "Kernel LLVM codegen: `raw_write` isn't supported in the LLVM backend -- there's no MMIO \
                  on a normal userspace process -- this only makes sense for the freestanding C backend"
             ),
-            "vec_new" | "vec_push" | "vec_get" | "vec_len" | "vec_set" => panic!(
-                "Kernel LLVM codegen: `{}` (Vec<T>) isn't supported in the LLVM native backend yet in \
-                 v1.x -- interpreter-only so far (real malloc/realloc-backed codegen for it is named \
-                 future work, not a silent cross-backend disagreement). Use `kernel run` for programs \
-                 that need a Vec, or a fixed-size array (`[T;N]`) if the size is known at compile time.",
-                name
-            ),
+            "vec_new" => self.vec_struct_type().const_zero().into(),
+            "vec_len" => {
+                let (addr, _elem_ty) = self.vec_name_and_elem_ty(arg_expr(args.first().unwrap_or_else(|| panic!("Kernel LLVM codegen: vec_len() requires one argument"))), ctx);
+                let len_ptr = self.builder.build_struct_gep(self.vec_struct_type(), addr, 1, "lenfield").unwrap();
+                self.builder.build_load(self.context.i64_type(), len_ptr, "len").unwrap()
+            }
+            "vec_get" => {
+                let (addr, elem_ty) = self.vec_name_and_elem_ty(arg_expr(args.first().unwrap_or_else(|| panic!("Kernel LLVM codegen: vec_get() requires a Vec and an index"))), ctx);
+                let idx_expr = arg_expr(args.get(1).unwrap_or_else(|| panic!("Kernel LLVM codegen: vec_get() requires a Vec and an index")));
+                let idx = self.gen_expr(idx_expr, ctx).into_int_value();
+                let data_ptr = self.builder.build_struct_gep(self.vec_struct_type(), addr, 0, "datafield").unwrap();
+                let data = self.builder.build_load(self.ptr_type(), data_ptr, "data").unwrap().into_pointer_value();
+                let len_ptr = self.builder.build_struct_gep(self.vec_struct_type(), addr, 1, "lenfield").unwrap();
+                let len = self.builder.build_load(self.context.i64_type(), len_ptr, "len").unwrap().into_int_value();
+                let checked_idx = self.gen_bounds_check_dynamic(idx, len, ctx);
+                let elem_llvm_ty = self.llvm_type(&elem_ty);
+                let elem_addr = unsafe { self.builder.build_gep(elem_llvm_ty, data, &[checked_idx], "vecelem").unwrap() };
+                self.builder.build_load(elem_llvm_ty, elem_addr, "vecval").unwrap()
+            }
+            "vec_push" => {
+                let (addr, elem_ty) = self.vec_name_and_elem_ty(arg_expr(args.first().unwrap_or_else(|| panic!("Kernel LLVM codegen: vec_push() requires a Vec and a value"))), ctx);
+                let val_expr = arg_expr(args.get(1).unwrap_or_else(|| panic!("Kernel LLVM codegen: vec_push() requires a Vec and a value")));
+                let val = self.gen_expr(val_expr, ctx);
+                self.gen_vec_push(addr, &elem_ty, val, ctx);
+                self.context.i64_type().const_zero().into() // Unit -- discarded, see gen_stmt's Stmt::Expr
+            }
+            "vec_set" => {
+                let (addr, elem_ty) = self.vec_name_and_elem_ty(arg_expr(args.first().unwrap_or_else(|| panic!("Kernel LLVM codegen: vec_set() requires a Vec, an index, and a value"))), ctx);
+                let idx_expr = arg_expr(args.get(1).unwrap_or_else(|| panic!("Kernel LLVM codegen: vec_set() requires a Vec, an index, and a value")));
+                let val_expr = arg_expr(args.get(2).unwrap_or_else(|| panic!("Kernel LLVM codegen: vec_set() requires a Vec, an index, and a value")));
+                let idx = self.gen_expr(idx_expr, ctx).into_int_value();
+                let val = self.gen_expr(val_expr, ctx);
+                let data_ptr = self.builder.build_struct_gep(self.vec_struct_type(), addr, 0, "datafield").unwrap();
+                let data = self.builder.build_load(self.ptr_type(), data_ptr, "data").unwrap().into_pointer_value();
+                let len_ptr = self.builder.build_struct_gep(self.vec_struct_type(), addr, 1, "lenfield").unwrap();
+                let len = self.builder.build_load(self.context.i64_type(), len_ptr, "len").unwrap().into_int_value();
+                let checked_idx = self.gen_bounds_check_dynamic(idx, len, ctx);
+                let elem_llvm_ty = self.llvm_type(&elem_ty);
+                let elem_addr = unsafe { self.builder.build_gep(elem_llvm_ty, data, &[checked_idx], "vecelem").unwrap() };
+                self.builder.build_store(elem_addr, val).unwrap();
+                self.context.i64_type().const_zero().into() // Unit -- discarded, see gen_stmt's Stmt::Expr
+            }
             _ if self.structs.contains(name) => {
                 let struct_ty = self.struct_types[name];
                 let fields = &self.struct_fields[name];
@@ -1056,8 +1259,31 @@ impl<'ctx> LlvmCodegen<'ctx> {
 
     fn gen_stmt(&self, s: &Stmt, ctx: &mut FnCtx<'ctx>) {
         match s {
-            Stmt::Let { name, value, .. } => {
-                let kernel_ty = self.infer_kernel_type(value, ctx);
+            Stmt::Let { name, ty, value, .. } => {
+                // `vec_new()` is the one expression in this language
+                // whose Kernel type can't be inferred from itself at
+                // all (no call-site argument to infer the element type
+                // from -- see RFC-002's Vec<T> section) -- it REQUIRES
+                // the `let`'s own explicit `: Vec<ElemType>` annotation,
+                // used directly here instead of going through the
+                // normal infer_kernel_type path (which would otherwise
+                // silently default to "int" and build the wrong alloca
+                // type entirely).
+                let kernel_ty = if let Expr::Call { name: cname, .. } = value {
+                    if cname == "vec_new" {
+                        ty.clone().unwrap_or_else(|| {
+                            panic!(
+                                "Kernel LLVM codegen: `let {} = vec_new()` needs an explicit `: Vec<ElemType>` \
+                                 annotation -- there's no call-site argument to infer the element type from",
+                                name
+                            )
+                        })
+                    } else {
+                        self.infer_kernel_type(value, ctx)
+                    }
+                } else {
+                    self.infer_kernel_type(value, ctx)
+                };
                 let val = self.gen_expr(value, ctx);
                 let llvm_ty = if matches!(value, Expr::Borrow(..)) { self.ptr_type().into() } else { self.llvm_type(&kernel_ty) };
                 let alloca = self.builder.build_alloca(llvm_ty, name).unwrap();

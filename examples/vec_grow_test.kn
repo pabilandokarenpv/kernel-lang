@@ -1,0 +1,8 @@
+fn main():
+    let mut v: Vec<int> = vec_new()
+    for i in 0..20:
+        vec_push(&mut v, i * 2)
+    print(vec_len(v))
+    print(vec_get(v, 0))
+    print(vec_get(v, 19))
+    print(vec_get(v, 10))

@@ -70,6 +70,34 @@ examples run unchanged, the rest are the named gaps below):
   target has no filesystem at all (so it still rejects both outright),
   while this backend targets a normal OS process that does. A failed
   `fopen` is a clear panic, never a silent NULL dereference.
+- `Vec<T>` (`vec_new`/`vec_push`/`vec_get`/`vec_len`/`vec_set`): REAL
+  growable-collection codegen -- the reverse asymmetry from file I/O.
+  Runtime layout is one universal LLVM struct `{ data: ptr, len: i64,
+  cap: i64 }` for ANY element type T (LLVM pointers are opaque since
+  LLVM 15+, so the struct's own shape never depends on T -- only each
+  element load/store/GEP needs T, passed explicitly as that GEP's
+  pointee type). `vec_push`'s growth path: if `len == cap`, `realloc`
+  the buffer to `(cap == 0 ? 4 : cap * 2) * elem_size` bytes --
+  `realloc(NULL, n)` is well-defined as malloc-equivalent, so there's no
+  separate first-allocation special case. Scoped to primitive element
+  types only (`int`/`float`/`bool`/`str`) -- struct/array/nested-Vec
+  elements are rejected with a named reason (`vec_elem_byte_size`):
+  sizing an arbitrary type for `realloc` needs a real ABI-size
+  computation (e.g. via inkwell's `TargetData`) this backend doesn't
+  have yet, and guessing wrong would silently corrupt the heap rather
+  than failing loudly. `vec_new()`'s element type can't be inferred from
+  the call itself (it takes no arguments) -- `gen_stmt`'s `Stmt::Let`
+  case special-cases exactly this one shape, reading the element type
+  from the `let`'s own explicit `: Vec<ElemType>` annotation instead of
+  going through the normal `infer_kernel_type` path. Bounds checks use a
+  RUNTIME length (the Vec's own `len` field), unlike fixed-size arrays'
+  compile-time-constant bound -- a separate `gen_bounds_check_dynamic`,
+  not a reuse of `gen_bounds_check`. The allocated buffer is never freed
+  on drop (no destructors/GC/arena in v1.x of either backend -- a named
+  leak, not a silent one, same as `gen_concat`'s string allocations).
+  Verified bit-for-bit against the interpreter across push/get/len/set,
+  growth past the initial capacity (20 pushes), all four supported
+  element types, and the out-of-bounds panic path.
 - Top-level `static`/`const` (including desugared enum variants) as real
   LLVM globals.
 - REAL short-circuit `&&`/`||` (actual branching + a phi, not a simple

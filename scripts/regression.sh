@@ -52,7 +52,7 @@ EXPECT_PANIC=("oob_panic_demo.kn")
 # LLVM backend's target -- a real OS process -- DOES have a heap, so it
 # genuinely supports Vec<T> even though C can't -- same asymmetry as
 # read_file/write_file, just the reverse direction).
-C_EXPECT_REJECT=("vec_test.kn")
+C_EXPECT_REJECT=("vec_test.kn" "vec_struct_test.kn" "vec_nested_test.kn" "vec_array_elem_test.kn")
 
 is_c_expect_reject() {
     local base

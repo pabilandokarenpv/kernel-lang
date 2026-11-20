@@ -79,13 +79,14 @@ examples run unchanged, the rest are the named gaps below):
   pointee type). `vec_push`'s growth path: if `len == cap`, `realloc`
   the buffer to `(cap == 0 ? 4 : cap * 2) * elem_size` bytes --
   `realloc(NULL, n)` is well-defined as malloc-equivalent, so there's no
-  separate first-allocation special case. Scoped to primitive element
-  types only (`int`/`float`/`bool`/`str`) -- struct/array/nested-Vec
-  elements are rejected with a named reason (`vec_elem_byte_size`):
-  sizing an arbitrary type for `realloc` needs a real ABI-size
-  computation (e.g. via inkwell's `TargetData`) this backend doesn't
-  have yet, and guessing wrong would silently corrupt the heap rather
-  than failing loudly. `vec_new()`'s element type can't be inferred from
+  separate first-allocation special case. Element byte size
+  (`vec_elem_byte_size`) is hand-known for primitives (`int`/`float`=8,
+  `bool`=1, `str`=8) but for everything else -- structs, fixed-size
+  arrays, even NESTED `Vec<Vec<int>>` -- goes through a real ABI-size
+  query against this backend's own `TargetData` (`compile_to_object`
+  now creates its `TargetMachine` BEFORE codegen runs, specifically so
+  its `TargetData` is available during it, not just at object-emission
+  time at the end). `vec_new()`'s element type can't be inferred from
   the call itself (it takes no arguments) -- `gen_stmt`'s `Stmt::Let`
   case special-cases exactly this one shape, reading the element type
   from the `let`'s own explicit `: Vec<ElemType>` annotation instead of
@@ -96,7 +97,8 @@ examples run unchanged, the rest are the named gaps below):
   on drop (no destructors/GC/arena in v1.x of either backend -- a named
   leak, not a silent one, same as `gen_concat`'s string allocations).
   Verified bit-for-bit against the interpreter across push/get/len/set,
-  growth past the initial capacity (20 pushes), all four supported
+  growth past the initial capacity (20 pushes), struct elements, fixed-
+  size-array elements, nested `Vec<Vec<int>>`, all four primitive
   element types, and the out-of-bounds panic path.
 - Top-level `static`/`const` (including desugared enum variants) as real
   LLVM globals.

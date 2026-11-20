@@ -121,9 +121,18 @@ impl Parser {
                 Token::LBracket => {
                     // Array type `[ElemType;N]` -- self-contained (element
                     // type can itself be any type string, e.g. a struct
-                    // name) and always terminal in v1.x: no nested arrays.
-                    // Reached either as the whole type (`[int;5]`) or after
-                    // the Amp branch above already pushed '&' (`&[int;5]`).
+                    // name). Reached either as the whole type (`[int;5]`),
+                    // after the Amp branch above already pushed '&'
+                    // (`&[int;5]`), OR nested inside a generic instantiation
+                    // (`Vec<[int;3]>`) -- that last case is why this can't
+                    // break unconditionally: at depth 0 it's the WHOLE
+                    // type and breaking is correct, but at depth > 0 (a
+                    // `<...>` is still open) breaking here would leave the
+                    // closing `>` completely unconsumed in the token
+                    // stream, exactly the same latent-bug shape
+                    // `Vec<int>`'s Ident case had before its own fix --
+                    // caught for real by `Vec<[int;3]>` failing to parse
+                    // with a confusing "expected Assign, found Gt" error.
                     self.advance(); // consume '['
                     let elem_ty = self.parse_type();
                     self.expect(Token::Semicolon);
@@ -136,7 +145,9 @@ impl Parser {
                     };
                     self.expect(Token::RBracket);
                     s.push_str(&format!("[{};{}]", elem_ty, size));
-                    break;
+                    if depth == 0 {
+                        break;
+                    }
                 }
                 _ => break,
             }

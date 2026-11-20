@@ -132,10 +132,16 @@ pub struct LlvmCodegen<'ctx> {
     // FnCtx::var_types, consulted wherever a local lookup misses (see
     // var_addr/var_kernel_type below).
     global_types: HashMap<String, String>,
+    // Real ABI-size queries for Vec<T>'s realloc sizing (vec_elem_byte_size)
+    // -- needed for element types beyond the hand-known primitives
+    // (structs, fixed-size arrays, nested Vecs). Owned by compile_to_object's
+    // TargetMachine, created BEFORE codegen runs specifically so this is
+    // available during it.
+    target_data: inkwell::targets::TargetData,
 }
 
 impl<'ctx> LlvmCodegen<'ctx> {
-    fn new(context: &'ctx Context, module_name: &str) -> Self {
+    fn new(context: &'ctx Context, module_name: &str, target_data: inkwell::targets::TargetData) -> Self {
         let module = context.create_module(module_name);
         let builder = context.create_builder();
         let ptr_ty = context.ptr_type(AddressSpace::default());
@@ -181,6 +187,7 @@ impl<'ctx> LlvmCodegen<'ctx> {
             functions: HashMap::new(),
             printf_fn,
             global_types: HashMap::new(),
+            target_data,
         }
     }
 
@@ -243,22 +250,17 @@ impl<'ctx> LlvmCodegen<'ctx> {
     }
 
     // Byte size of ONE element, for realloc's sizing in vec_push's
-    // growth path. Scoped to v1.x's primitive element types only --
-    // struct/array/nested-Vec elements would need a real sizeof
-    // computation (TargetData-based) that this backend doesn't have
-    // yet; named here as a real, honest gap rather than silently
-    // guessing a wrong size and corrupting the heap.
+    // growth path. Primitives are hand-known (cheap, no query needed);
+    // anything else (structs, fixed-size arrays, nested Vecs) goes
+    // through a REAL ABI-size query against this backend's TargetData
+    // -- the honest way to size an arbitrary type for realloc, rather
+    // than guessing and silently corrupting the heap on a wrong size.
     fn vec_elem_byte_size(&self, ty: &str) -> u64 {
         match ty.trim() {
             "int" | "float" => 8,
             "bool" => 1,
             "str" => 8, // a pointer
-            other => panic!(
-                "Kernel LLVM codegen: `Vec<{}>` isn't supported in v1.x -- only Vec<int>/Vec<float>/Vec<bool>/Vec<str> \
-                 (primitive element types) are, since sizing a struct/array/nested-Vec element for realloc needs a \
-                 real sizeof computation this backend doesn't have yet",
-                other
-            ),
+            other => self.target_data.get_abi_size(&self.llvm_type(other)),
         }
     }
 
@@ -1538,18 +1540,12 @@ pub fn compile_to_object(program: &Program, out_obj_path: &Path) {
     Target::initialize_native(&InitializationConfig::default())
         .unwrap_or_else(|e| panic!("Kernel LLVM codegen: failed to initialize the native LLVM target: {}", e));
 
-    let context = Context::create();
-    let mut codegen = LlvmCodegen::new(&context, "kernel_module");
-    codegen.generate(program);
-
-    if let Err(e) = codegen.module.verify() {
-        panic!(
-            "Kernel LLVM codegen: the generated LLVM module failed verification -- this is a real \
-             codegen bug (not a Kernel-level error in the input program):\n{}",
-            e.to_string()
-        );
-    }
-
+    // Created BEFORE codegen.generate() runs (not after, as originally
+    // written) specifically so its TargetData is available DURING
+    // codegen -- vec_elem_byte_size needs a real ABI-size query for
+    // Vec<T> element types beyond the hand-known primitives (structs,
+    // fixed-size arrays, nested Vecs), and that requires a real
+    // TargetMachine/TargetData, not just a guess.
     let triple = TargetMachine::get_default_triple();
     let target = Target::from_triple(&triple).unwrap_or_else(|e| panic!("Kernel LLVM codegen: no LLVM target for {}: {}", triple, e));
     let target_machine = target
@@ -1562,6 +1558,19 @@ pub fn compile_to_object(program: &Program, out_obj_path: &Path) {
             CodeModel::Default,
         )
         .unwrap_or_else(|| panic!("Kernel LLVM codegen: could not create a target machine for {}", triple));
+    let target_data = target_machine.get_target_data();
+
+    let context = Context::create();
+    let mut codegen = LlvmCodegen::new(&context, "kernel_module", target_data);
+    codegen.generate(program);
+
+    if let Err(e) = codegen.module.verify() {
+        panic!(
+            "Kernel LLVM codegen: the generated LLVM module failed verification -- this is a real \
+             codegen bug (not a Kernel-level error in the input program):\n{}",
+            e.to_string()
+        );
+    }
 
     target_machine
         .write_to_file(&codegen.module, FileType::Object, out_obj_path)

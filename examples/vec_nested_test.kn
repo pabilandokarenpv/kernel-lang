@@ -1,0 +1,11 @@
+fn main():
+    let mut outer: Vec<Vec<int>> = vec_new()
+    let mut inner1: Vec<int> = vec_new()
+    vec_push(&mut inner1, 1)
+    vec_push(&mut inner1, 2)
+    vec_push(&mut outer, inner1)
+    print(vec_len(outer))
+    let got = vec_get(outer, 0)
+    print(vec_len(got))
+    print(vec_get(got, 0))
+    print(vec_get(got, 1))

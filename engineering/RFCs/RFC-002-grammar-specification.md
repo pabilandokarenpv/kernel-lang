@@ -125,15 +125,13 @@ a silent miscompile.
   compile-time size. Real support on TWO of the three backends:
   interpreter (see above) AND the LLVM native backend (real
   `realloc`-backed growth -- doubling capacity, starting at 4 -- see
-  RFC-003 for the full design). The C/freestanding backend explicitly
-  rejects it (no heap allocator in a freestanding kernel -- the exact
-  reverse of the file-I/O asymmetry: THERE the C backend's target lacks
-  a filesystem; HERE it lacks a heap). `kernel build-native`'s Vec<T>
-  is scoped to primitive element types only in v1.x
-  (`int`/`float`/`bool`/`str`) -- struct/array/nested-Vec elements are
-  rejected with a clear, named reason (sizing an arbitrary element type
-  for `realloc` needs a real `sizeof` computation this backend doesn't
-  have yet). `let v: Vec<int> = vec_new()` requires the explicit
+  RFC-003 for the full design, including how a real `TargetData` ABI-
+  size query lets `Vec<T>` work for ANY element type -- structs, fixed-
+  size arrays, even nested `Vec<Vec<int>>` -- not just primitives). The
+  C/freestanding backend explicitly rejects it (no heap allocator in a
+  freestanding kernel -- the exact reverse of the file-I/O asymmetry:
+  THERE the C backend's target lacks a filesystem; HERE it lacks a
+  heap). `let v: Vec<int> = vec_new()` requires the explicit
   `: Vec<int>` annotation because, unlike every other generic in this
   language, there's no call-site ARGUMENT to infer the element type from
   (`vec_new()` takes none) -- monomorphize.rs's usual
@@ -146,13 +144,16 @@ a silent miscompile.
   since that backend has real pointers). The checker correspondingly
   treats all five `vec_*` builtins as never "moving" their Vec argument
   (same exemption `len()` gets), so the variable stays usable across
-  repeated `vec_push` calls. Adding this surfaced and fixed a real,
-  previously-latent parser bug: `parse_type()` had never actually
+  repeated `vec_push` calls. Adding this surfaced and fixed TWO real,
+  previously-latent parser bugs: `parse_type()` had never actually
   supported `Name<Arg>` type annotations at all (it broke out of its
   loop right after the first identifier, before ever checking for a
-  following `<`) -- nothing in the existing example suite had ever
-  written one, since every other generic in the language is inferred
-  from call-site arguments instead.
+  following `<`), and its array-type branch (`[ElemType;N]`) broke
+  unconditionally even when NESTED inside a still-open generic (e.g.
+  `Vec<[int;3]>`), leaving the closing `>` unconsumed -- the exact same
+  bug shape, just in a second place. Nothing in the existing example
+  suite had ever written either, since every other generic in the
+  language is inferred from call-site arguments instead.
 - **A module/import system now exists**: `import foo` / `import utils.math`
   (see `modules.rs`). v1.x scope: unqualified textual splice (no
   qualified names, no pub/private visibility -- every imported item

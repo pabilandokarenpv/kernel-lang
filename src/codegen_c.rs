@@ -23,16 +23,26 @@ use std::collections::{HashMap, HashSet};
 pub struct Codegen {
     structs: HashSet<String>,
     functions: HashMap<String, FnDecl>,
+    // struct name -> (field name -> field's Kernel-level type string), so
+    // Expr::Field can resolve the real field type instead of guessing --
+    // needed because the AST stores a struct's own type as a plain string
+    // (see ast.rs), the same representation c_type() already converts.
+    struct_fields: HashMap<String, HashMap<String, String>>,
 }
 
 impl Codegen {
     pub fn new(program: &Program) -> Self {
         let mut structs = HashSet::new();
         let mut functions = HashMap::new();
+        let mut struct_fields = HashMap::new();
         for item in &program.items {
             match item {
                 Item::Struct(s) => {
                     structs.insert(s.name.clone());
+                    struct_fields.insert(
+                        s.name.clone(),
+                        s.fields.iter().map(|(n, t)| (n.clone(), t.clone())).collect(),
+                    );
                 }
                 Item::Function(f) => {
                     functions.insert(f.name.clone(), f.clone());
@@ -40,7 +50,7 @@ impl Codegen {
                 _ => {}
             }
         }
-        Codegen { structs, functions }
+        Codegen { structs, functions, struct_fields }
     }
 
     fn c_type(&self, ty: &str) -> String {
@@ -90,7 +100,20 @@ impl Codegen {
             Expr::Binary(..) => "long".to_string(),
             Expr::Unary(UnaryOp::Neg, inner) => self.infer_c_type(inner, var_types),
             Expr::Unary(..) => "long".to_string(),
-            Expr::Field(..) => "long".to_string(), // v1: only primitive fields are read this way
+            Expr::Field(obj, field) => {
+                // Resolve the base's struct type, then look up the field's
+                // declared Kernel type and convert it -- falls back to
+                // "long" only if the base isn't a recognized struct type
+                // (e.g. inference already failed upstream), never silently
+                // guessing for a struct we do know about.
+                let obj_ty = self.infer_c_type(obj, var_types);
+                obj_ty
+                    .strip_prefix("struct ")
+                    .and_then(|struct_name| self.struct_fields.get(struct_name))
+                    .and_then(|fields| fields.get(field.as_str()))
+                    .map(|kernel_ty| self.c_type(kernel_ty))
+                    .unwrap_or_else(|| "long".to_string())
+            }
             Expr::Ident(name) => var_types.get(name).cloned().unwrap_or_else(|| "long".to_string()),
             Expr::Borrow(_, _) | Expr::Range(..) => "long".to_string(),
             Expr::Call { name, args } => {

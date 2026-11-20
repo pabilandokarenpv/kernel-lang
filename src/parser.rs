@@ -191,8 +191,27 @@ impl Parser {
         }
     }
 
+    // Parses an optional `<T>` or `<T, U, ...>` type-parameter list right
+    // after a function or struct name -- shared between parse_fn_rest and
+    // parse_struct since the syntax (and meaning: these are generics, see
+    // ast.rs's FnDecl/StructDecl.type_params) is identical in both spots.
+    fn parse_optional_type_params(&mut self) -> Vec<String> {
+        let mut type_params = Vec::new();
+        if self.eat(&Token::Lt) {
+            loop {
+                type_params.push(self.ident());
+                if !self.eat(&Token::Comma) {
+                    break;
+                }
+            }
+            self.expect(Token::Gt);
+        }
+        type_params
+    }
+
     fn parse_fn_rest(&mut self, is_unsafe: bool) -> FnDecl {
         let name = self.ident();
+        let type_params = self.parse_optional_type_params();
         self.expect(Token::LParen);
         let mut params = Vec::new();
         while !self.check(&Token::RParen) {
@@ -245,11 +264,12 @@ impl Parser {
         };
         self.expect(Token::Colon);
         let body = self.parse_block();
-        FnDecl { name, is_unsafe, params, return_ty, body }
+        FnDecl { name, is_unsafe, type_params, params, return_ty, body }
     }
 
     fn parse_struct(&mut self) -> StructDecl {
         let name = self.ident();
+        let type_params = self.parse_optional_type_params();
         self.expect(Token::Colon);
         self.expect(Token::Newline);
         self.expect(Token::Indent);
@@ -266,7 +286,7 @@ impl Parser {
             self.skip_newlines();
         }
         self.expect(Token::Dedent);
-        StructDecl { name, fields }
+        StructDecl { name, type_params, fields }
     }
 
     fn parse_block(&mut self) -> Vec<Stmt> {

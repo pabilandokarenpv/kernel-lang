@@ -3,6 +3,7 @@ mod checker;
 mod codegen_c;
 mod interpreter;
 mod lexer;
+mod monomorphize;
 mod parser;
 
 use checker::Checker;
@@ -47,6 +48,10 @@ fn load_checked(path: &str) -> ast::Program {
     let src = fs::read_to_string(path).unwrap_or_else(|e| panic!("could not read {}: {}", path, e));
     let tokens = Lexer::new(&src).tokenize();
     let program = Parser::new(tokens).parse_program();
+    // Generics (v1.x) are fully erased here, before the checker ever runs:
+    // every generic fn/struct is replaced by one concrete, mangled copy per
+    // distinct type it's actually instantiated with (see monomorphize.rs).
+    let program = monomorphize::monomorphize(program);
     let errors = Checker::new(&program).check(&program);
     if !errors.is_empty() {
         eprintln!("error: Kernel safety check failed in {}:\n", path);

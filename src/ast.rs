@@ -21,6 +21,12 @@ pub enum Item {
 pub struct FnDecl {
     pub name: String,
     pub is_unsafe: bool,
+    pub type_params: Vec<String>, // generics (v1.x): e.g. ["T"] for fn identity<T>(x: T) -> T.
+    // Empty for an ordinary non-generic function. Generic functions never
+    // reach the checker/interpreter/codegen directly -- monomorphize.rs
+    // substitutes each distinct concrete type actually used at a call site
+    // and emits a fully concrete FnDecl per instantiation before checking
+    // ever runs, so nothing downstream needs to know generics exist at all.
     pub params: Vec<Param>,
     pub return_ty: Option<String>,
     pub body: Vec<Stmt>,
@@ -44,6 +50,7 @@ pub struct Param {
 #[derive(Debug, Clone)]
 pub struct StructDecl {
     pub name: String,
+    pub type_params: Vec<String>, // generics (v1.x), same role as FnDecl's
     pub fields: Vec<(String, String)>, // (field name, type)
 }
 

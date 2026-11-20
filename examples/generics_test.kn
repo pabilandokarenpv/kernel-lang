@@ -1,0 +1,15 @@
+struct Box<T>:
+    value: T
+
+fn identity<T>(x: T) -> T:
+    return x
+
+fn main():
+    print(identity(5))
+    print(identity("hello"))
+    print(identity(3.5))
+
+    let b1 = Box(value: 10)
+    let b2 = Box(value: "text")
+    print(b1.value)
+    print(b2.value)

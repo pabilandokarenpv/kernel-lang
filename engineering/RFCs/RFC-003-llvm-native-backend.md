@@ -55,10 +55,23 @@ examples run unchanged, the rest are the named gaps below):
   `kernel_runtime/runtime.c`'s `kernel_panic` halt, just via a real OS
   process exit instead of a freestanding halt loop. Returning an array
   BY VALUE is still rejected, same reason `codegen_c.rs` rejects it too.
-- Borrows (`&T`/`&mut T`) -- same scope as `codegen_c.rs`: field access
-  through a borrowed PARAMETER works; field access through a locally
-  `let`-bound borrow does not (an accepted limit carried over, not a new
-  one -- see codegen_llvm.rs's FnCtx::is_ptr doc comment).
+- Borrows (`&T`/`&mut T`): field/array access through a borrowed
+  PARAMETER **and** through a locally `let`-bound borrow both work
+  correctly now, verified identical to the interpreter and (where the C
+  backend doesn't separately reject it for an unrelated reason) to
+  `kernel build` too. Field access through a local borrow was a real,
+  previously-latent bug until this was fixed: `struct_base_ptr`/
+  `array_base_ptr` only checked `FnCtx::is_ptr` (tracks function
+  PARAMETERS only) to decide whether to dereference, missing a locally-
+  bound borrow entirely and reading one level of indirection too
+  shallow -- a garbage pointer bit-pattern, not just a wrong value.
+  Unreachable before the checker's NLL improvement (RFC-002) let any
+  program combining a local borrow with a subsequent move past the old,
+  stricter lexical borrow-scoping at all. Fixed with the same
+  `kernel_ty.starts_with('&')` check `gen_expr`'s `Expr::Ident` case
+  already used for an earlier, related bug. See
+  `examples/nll_release_after_last_use_ok.kn` for the verified-correct
+  case (native output matches the interpreter exactly: `1`, `99`).
 - `print` (real libc `printf`, one dynamically-built format string per
   call site), `abs` (manual `select`-based implementation, no libm
   dependency), and `len()` (a compile-time constant for arrays, real

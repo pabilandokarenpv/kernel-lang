@@ -638,12 +638,25 @@ impl<'ctx> LlvmCodegen<'ctx> {
 
     // The address of the STRUCT a field-access expression's base refers
     // to -- handles the is_ptr dereference-vs-direct distinction exactly
-    // like codegen_c.rs's accessor() picks "." vs "->".
+    // like codegen_c.rs's accessor() picks "." vs "->". Checks BOTH
+    // `is_ptr` (function parameters) AND the variable's own Kernel type
+    // (`&...`) -- `is_ptr` alone misses a LOCALLY `let`-bound borrow
+    // (`let r = &p; r.field`), which is never tracked there (see
+    // FnCtx::is_ptr's doc comment) -- a real, previously-latent bug,
+    // unreachable until the checker's NLL improvement let more programs
+    // with locally-bound borrows through at all: `r`'s own alloca holds
+    // a POINTER VALUE, so treating its address AS the struct directly
+    // (without the load this now does) read one level of indirection
+    // too shallow -- a garbage pointer bit-pattern, not just a wrong
+    // value. Same fix shape as gen_expr's Expr::Ident case already
+    // uses (see its own comment) -- this accessor just hadn't gotten
+    // it yet.
     fn struct_base_ptr(&self, obj: &Expr, ctx: &FnCtx<'ctx>) -> PointerValue<'ctx> {
         match obj {
             Expr::Ident(name) => {
                 let addr = self.var_addr(name, ctx);
-                if *ctx.is_ptr.get(name).unwrap_or(&false) {
+                let needs_deref = *ctx.is_ptr.get(name).unwrap_or(&false) || self.var_kernel_type(name, ctx).starts_with('&');
+                if needs_deref {
                     self.builder.build_load(self.ptr_type(), addr, "deref").unwrap().into_pointer_value()
                 } else {
                     addr
@@ -666,7 +679,10 @@ impl<'ctx> LlvmCodegen<'ctx> {
         match arr {
             Expr::Ident(name) => {
                 let addr = self.var_addr(name, ctx);
-                if *ctx.is_ptr.get(name).unwrap_or(&false) {
+                // Same is_ptr-alone-misses-a-local-borrow fix as
+                // struct_base_ptr above, for `let r = &arr; r[i]`.
+                let needs_deref = *ctx.is_ptr.get(name).unwrap_or(&false) || self.var_kernel_type(name, ctx).starts_with('&');
+                if needs_deref {
                     self.builder.build_load(self.ptr_type(), addr, "arrderef").unwrap().into_pointer_value()
                 } else {
                     addr

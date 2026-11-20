@@ -98,6 +98,26 @@ pub struct Interpreter {
     structs: HashMap<String, StructDecl>,
     globals: HashMap<String, Value>,
     scopes: Vec<HashMap<String, Value>>,
+    // Tracks, per currently-live scope (parallel to `scopes` -- pushed/
+    // popped at every one of the same sites), which local names are
+    // bound to a persistent borrow (`let r = &x`/`let r = &mut x`) and
+    // what variable they alias. Closes a real gap: this interpreter
+    // never modeled aliasing at the VALUE level at all (see
+    // Expr::Borrow's eval arm -- `&x` just evaluates `x`, producing an
+    // independent clone with no memory of where it came from), so
+    // mutating THROUGH a borrowed reference (`let r = &mut p; r.x =
+    // 5;`) silently mutated only `r`'s own disconnected copy, never
+    // `p` -- caught for real: `print(p.x)` after exactly that sequence
+    // printed the ORIGINAL value, not the mutated one, while the C and
+    // LLVM native backends (which have real addresses) both mutate `p`
+    // correctly. Scoped deliberately narrow: only resolves a DIRECT
+    // `let NAME = &TARGET` alias (one level, TARGET itself a plain
+    // ident) -- consulted by Stmt::FieldAssign/Stmt::IndexAssign's
+    // resolve_alias helper before mutating. Borrowed FUNCTION
+    // PARAMETERS aliasing back to the CALLER's variable remain a
+    // separate, narrower, still-real gap, not fixed here (would need
+    // threading alias info across the call boundary itself).
+    ref_aliases: Vec<HashMap<String, String>>,
     pub trace: Vec<String>,  // execution trace: lets, assigns, branches taken
     pub output: Vec<String>, // captured `print` lines (one entry per print statement)
 }
@@ -109,6 +129,7 @@ impl Interpreter {
             structs: HashMap::new(),
             globals: HashMap::new(),
             scopes: Vec::new(),
+            ref_aliases: Vec::new(),
             trace: Vec::new(),
             output: Vec::new(),
         }
@@ -139,11 +160,13 @@ impl Interpreter {
             .cloned()
             .expect("Kernel interpreter: no `main` function defined");
         self.scopes.push(HashMap::new());
+        self.ref_aliases.push(HashMap::new());
         let result = match self.exec_block(&main.body) {
             Flow::Return(v) => v,
             Flow::Normal => Value::Unit,
         };
         self.scopes.pop();
+        self.ref_aliases.pop();
         result
     }
 
@@ -200,6 +223,28 @@ impl Interpreter {
         self.scopes.last_mut().unwrap().insert(name.to_string(), value);
     }
 
+    // Records that local `name` is a persistent-borrow alias of
+    // `target` -- called from Stmt::Let whenever `value` is a direct
+    // `&TARGET`/`&mut TARGET` (TARGET itself a plain ident). See
+    // `ref_aliases`'s own doc comment for the real bug this exists to
+    // fix.
+    fn set_alias(&mut self, name: &str, target: &str) {
+        self.ref_aliases.last_mut().unwrap().insert(name.to_string(), target.to_string());
+    }
+
+    // Resolves `name` through its alias, if it has one (searching every
+    // currently-live scope, innermost first, same lookup order as
+    // get_var/set_var) -- returns `name` itself unchanged if it isn't a
+    // known alias (the common case: a plain owned variable).
+    fn resolve_alias(&self, name: &str) -> String {
+        for scope in self.ref_aliases.iter().rev() {
+            if let Some(target) = scope.get(name) {
+                return target.clone();
+            }
+        }
+        name.to_string()
+    }
+
     fn exec_block(&mut self, stmts: &[Stmt]) -> Flow {
         for stmt in stmts {
             match self.exec_stmt(stmt) {
@@ -216,6 +261,16 @@ impl Interpreter {
                 let v = self.eval(value);
                 self.trace.push(format!("let {} = {}", name, v));
                 self.scopes.last_mut().unwrap().insert(name.clone(), v);
+                // See ref_aliases's doc comment: a direct `&TARGET`/
+                // `&mut TARGET` (TARGET a plain ident) makes `name` an
+                // alias, so a later mutation THROUGH it (FieldAssign/
+                // IndexAssign) resolves to TARGET instead of silently
+                // mutating only `name`'s own disconnected copy.
+                if let Expr::Borrow(inner, _) = value {
+                    if let Expr::Ident(target) = inner.as_ref() {
+                        self.set_alias(name, target);
+                    }
+                }
                 Flow::Normal
             }
             Stmt::Assign { name, op, value } => {
@@ -238,12 +293,17 @@ impl Interpreter {
             }
             Stmt::FieldAssign { object, field, value } => {
                 if let Expr::Ident(obj_name) = object {
+                    // Resolve THROUGH a persistent-borrow alias first
+                    // (see ref_aliases's doc comment) -- `r.field = x`
+                    // where `r` came from `let r = &mut p` must mutate
+                    // `p`, not `r`'s own disconnected copy.
+                    let real_name = self.resolve_alias(obj_name);
                     let v = self.eval(value);
-                    let mut s = self.get_var(obj_name);
+                    let mut s = self.get_var(&real_name);
                     if let Value::Struct(_, ref mut fields) = s {
                         fields.insert(field.clone(), v);
                     }
-                    self.set_var(obj_name, s);
+                    self.set_var(&real_name, s);
                 }
                 Flow::Normal
             }
@@ -256,9 +316,12 @@ impl Interpreter {
                 let Expr::Ident(arr_name) = array else {
                     panic!("Kernel interpreter: `arr[i] = value` requires `arr` to be a plain variable in v1.x, found {:?}", array);
                 };
+                // Resolve THROUGH a persistent-borrow alias first, same
+                // reasoning as FieldAssign above.
+                let real_name = self.resolve_alias(arr_name);
                 let i = as_int(&self.eval(index));
                 let v = self.eval(value);
-                let mut arr_val = self.get_var(arr_name);
+                let mut arr_val = self.get_var(&real_name);
                 if let Value::Array(ref mut items) = arr_val {
                     if i < 0 || i as usize >= items.len() {
                         panic!("Kernel interpreter: array index {} out of bounds (len {})", i, items.len());
@@ -267,7 +330,7 @@ impl Interpreter {
                 } else {
                     panic!("Kernel interpreter: indexed assignment on a non-array value");
                 }
-                self.set_var(arr_name, arr_val);
+                self.set_var(&real_name, arr_val);
                 Flow::Normal
             }
             Stmt::If { arms, else_body } => {
@@ -275,16 +338,20 @@ impl Interpreter {
                     if truthy(&self.eval(cond)) {
                         self.trace.push(format!("branch taken: if {:?}", cond));
                         self.scopes.push(HashMap::new());
+        self.ref_aliases.push(HashMap::new());
                         let f = self.exec_block(body);
                         self.scopes.pop();
+        self.ref_aliases.pop();
                         return f;
                     }
                 }
                 if let Some(body) = else_body {
                     self.trace.push("branch taken: else".to_string());
                     self.scopes.push(HashMap::new());
+        self.ref_aliases.push(HashMap::new());
                     let f = self.exec_block(body);
                     self.scopes.pop();
+        self.ref_aliases.pop();
                     return f;
                 }
                 Flow::Normal
@@ -292,8 +359,10 @@ impl Interpreter {
             Stmt::While { cond, body } => {
                 while truthy(&self.eval(cond)) {
                     self.scopes.push(HashMap::new());
+        self.ref_aliases.push(HashMap::new());
                     let f = self.exec_block(body);
                     self.scopes.pop();
+        self.ref_aliases.pop();
                     if let Flow::Return(v) = f {
                         return Flow::Return(v);
                     }
@@ -306,9 +375,11 @@ impl Interpreter {
                     let hi = as_int(&self.eval(hi));
                     for i in lo..hi {
                         self.scopes.push(HashMap::new());
+        self.ref_aliases.push(HashMap::new());
                         self.scopes.last_mut().unwrap().insert(var.clone(), Value::Int(i));
                         let f = self.exec_block(body);
                         self.scopes.pop();
+        self.ref_aliases.pop();
                         if let Flow::Return(v) = f {
                             return Flow::Return(v);
                         }
@@ -507,6 +578,10 @@ impl Interpreter {
                 let Some(vec_name) = vec_name else {
                     panic!("Kernel interpreter: `{}`'s first argument must be a plain Vec variable name (optionally `&mut`-prefixed), not an arbitrary expression", name);
                 };
+                // Resolve THROUGH a persistent-borrow alias first (see
+                // ref_aliases's doc comment) -- `vec_push(r, x)` where
+                // `r` came from `let r = &mut v` must mutate `v`.
+                let vec_name = self.resolve_alias(&vec_name);
                 let mut items = match self.get_var(&vec_name) {
                     Value::Vec(items) => items,
                     other => panic!("Kernel interpreter: `{}` expects a Vec, found {:?}", name, other),
@@ -619,11 +694,13 @@ impl Interpreter {
             scope.insert(param.name.clone(), val);
         }
         self.scopes.push(scope);
+        self.ref_aliases.push(HashMap::new());
         let result = match self.exec_block(&func.body) {
             Flow::Return(v) => v,
             Flow::Normal => Value::Unit,
         };
         self.scopes.pop();
+        self.ref_aliases.pop();
         result
     }
 }

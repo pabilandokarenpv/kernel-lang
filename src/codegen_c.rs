@@ -379,9 +379,24 @@ impl Codegen {
         f.params.iter().map(|p| (p.name.clone(), p.borrowed)).collect()
     }
 
-    fn accessor<'a>(&self, base: &Expr, is_ptr: &HashMap<String, bool>) -> &'a str {
+    // Same is_ptr-alone-misses-a-local-borrow fix as codegen_llvm.rs's
+    // struct_base_ptr/array_base_ptr -- `is_ptr` only tracks function
+    // PARAMETERS (`param_pointer_map`), never a locally `let`-bound
+    // borrow, so `let r = &p; r.x = 5;` generated "." instead of "->"
+    // for a variable gcc itself correctly typed as a pointer, failing
+    // (loud, at least -- a real gcc compile error, not a silent
+    // miscompile) with "'r' is a pointer; did you mean to use '->'?".
+    // Checking `var_types`'s own recorded C type too (a trailing `*`
+    // means a pointer) closes it for real, matching codegen_llvm.rs's
+    // identical fix (there, Kernel-level types are checked with a
+    // leading `&` instead -- this backend's `var_types` stores already-
+    // converted C-syntax type strings, e.g. `"struct Point*"`, not
+    // Kernel-syntax ones).
+    fn accessor(&self, base: &Expr, is_ptr: &HashMap<String, bool>, var_types: &HashMap<String, String>) -> &'static str {
         if let Expr::Ident(name) = base {
-            if *is_ptr.get(name).unwrap_or(&false) {
+            let is_ref = *is_ptr.get(name).unwrap_or(&false)
+                || var_types.get(name).map(|t| t.ends_with('*')).unwrap_or(false);
+            if is_ref {
                 return "->";
             }
         }
@@ -426,7 +441,7 @@ impl Codegen {
                 )
             }
             Expr::Field(obj, field) => {
-                format!("{}{}{}", self.expr(obj, is_ptr, var_types), self.accessor(obj, is_ptr), field)
+                format!("{}{}{}", self.expr(obj, is_ptr, var_types), self.accessor(obj, is_ptr, var_types), field)
             }
             Expr::ArrayLit(elems) => {
                 // Bare C brace-init -- valid directly in a `let`/struct-
@@ -601,7 +616,7 @@ impl Codegen {
                     "{}{}{}{} = {};\n",
                     pad,
                     self.expr(object, is_ptr, var_types),
-                    self.accessor(object, is_ptr),
+                    self.accessor(object, is_ptr, var_types),
                     field,
                     self.expr(value, is_ptr, var_types)
                 )

@@ -87,6 +87,68 @@ flowchart LR
   targets a name that's already either a local or a global -- `let` is
   the only thing that introduces a genuinely NEW binding, and it never
   goes through `set_var` at all). See `examples/global_persist_test.kn`.
+- **Real (partial) Non-Lexical-Lifetime borrow release**: a persistent
+  (`let`-bound) borrow is now released right after its REAL last
+  reference within its own block, rather than always waiting for the
+  block to end regardless of whether it's ever used again -- see
+  `checker.rs`'s `check_block` for the full design (and its honest
+  "deliberately partial" scope: a reference nested inside an `if`/
+  `while`/`for` body only shortens the borrow to the end of that WHOLE
+  containing statement, never to a point inside one specific branch --
+  genuinely full path-sensitive NLL remains future work). Matches real
+  Rust's NLL behavior for the classic "entirely unused borrow" case too:
+  `let r = &x; move_it(x);` with `r` never referenced again is now
+  correctly ACCEPTED (its live range is empty), where the old purely
+  lexical scoping incorrectly rejected it. See
+  `examples/nll_release_after_last_use_ok.kn` and
+  `examples/nll_unused_borrow_ok.kn` for the two newly-accepted
+  patterns, and the updated `examples/bad_move_while_borrowed.kn` (a
+  borrow that's GENUINELY still live -- referenced again after the move
+  attempt -- is still correctly rejected).
+- Implementing this surfaced and fixed THREE further real, previously-
+  undiscovered bugs, none of them actually about NLL itself -- each one
+  had simply never been reachable before, since the old, stricter
+  lexical scoping always rejected any program that would have exercised
+  them:
+  1. **A real regression from the immutability work above**: mutating
+     THROUGH a `&mut` reference (`let r = &mut p; r.x = 5;`) was
+     incorrectly rejected with "cannot mutate `r` -- it was declared
+     with `let`, not `let mut`" -- conflating "is `r`'s own BINDING
+     reassignable" with "is the REFERENT mutable through this
+     reference," two different things. Fixed with a new
+     `VarState::ref_exclusive` field and a `check_mutable_through`
+     helper: a reference's own exclusivity governs mutation through it,
+     never the reassignability of the binding holding it. Also correctly
+     rejects the real unsound case this enables checking for the first
+     time: mutating through a merely SHARED (`&T`) borrow. See
+     `examples/bad_mutate_through_shared_borrow.kn`.
+  2. **A real, deep interpreter bug**: `kernel run` never modeled
+     aliasing at the value level AT ALL (`&x` just evaluates `x`,
+     producing an independent clone with no memory of where it came
+     from) -- so mutating through a borrowed reference silently mutated
+     only the reference's own disconnected copy, never the original.
+     Caught for real: `let r = &mut p; r.x = 99; print(p.x)` printed the
+     ORIGINAL value, not `99`, while `kernel build`/`kernel build-native`
+     (both have real addresses) mutated `p` correctly. Fixed with a new
+     `ref_aliases` side-table (parallel to `scopes`) resolving a
+     reference's name back to what it aliases before `FieldAssign`/
+     `IndexAssign`/`vec_push`/`vec_set` mutate -- scoped to one level of
+     direct `let NAME = &TARGET` aliasing; borrowed FUNCTION PARAMETERS
+     aliasing back to the caller's variable remain a separate, narrower,
+     still-real gap, not fixed here.
+  3. **A real, deep LLVM-native-backend bug**: `codegen_llvm.rs`'s
+     `struct_base_ptr`/`array_base_ptr` only checked `is_ptr` (which
+     tracks FUNCTION PARAMETERS only) to decide whether to dereference a
+     variable's own alloca before treating it as a struct/array's base
+     address -- missing a LOCALLY `let`-bound borrow entirely (never
+     tracked in `is_ptr` at all), reading one level of indirection too
+     shallow and producing a garbage pointer bit-pattern. Unreachable
+     before this NLL work, since the checker never previously accepted
+     a program combining a local borrow with anything that would expose
+     it this way. Fixed with the exact same `kernel_ty.starts_with('&')`
+     check `gen_expr`'s `Expr::Ident` case already used for an earlier,
+     related bug -- these two accessors just hadn't gotten it yet. See
+     RFC-003 for the native-backend-specific detail.
 
 ## Types (v1)
 

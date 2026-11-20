@@ -8,4 +8,11 @@ fn take(p: Point):
 fn main():
     let origin = Point(x: 1, y: 1)
     let r1 = &origin
-    take(origin)        # ERROR: cannot move origin, r1 still holds a live borrow of it
+    take(origin)        # ERROR: cannot move origin, r1 is still live -- it's
+                         # read again below, so its real last use is AFTER
+                         # this move, not before it (see the NLL improvement
+                         # in checker.rs's check_block -- an UNUSED borrow
+                         # would correctly die immediately and allow this
+                         # move; this one doesn't, since it's genuinely
+                         # still needed)
+    print(r1.x)

@@ -1,0 +1,20 @@
+struct Point:
+    x: int
+    y: int
+
+fn take(p: Point):
+    print(p.x)
+
+fn main():
+    let origin = Point(x: 1, y: 1)
+    let r1 = &origin    # never used again below -- dies immediately,
+                         # real NLL semantics, not the old purely lexical
+                         # ("alive until end of enclosing block regardless
+                         # of actual use") scoping this replaces. Matches
+                         # real Rust's NLL behavior for a genuinely unused
+                         # borrow (the classic textbook NLL example).
+    take(origin)        # ACCEPTED: r1 is dead by this point -- the OLD
+                         # lexical-only checker incorrectly rejected this
+                         # (see bad_move_while_borrowed.kn for the
+                         # still-correctly-rejected case: a borrow that's
+                         # ACTUALLY used again after the move attempt).

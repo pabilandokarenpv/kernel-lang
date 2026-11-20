@@ -312,6 +312,7 @@ impl Interpreter {
                 }
             }
             Expr::Borrow(e, _exclusive) => self.eval(e), // interpreter doesn't model aliasing, just the value
+            Expr::Closure { .. } => unreachable!("Kernel interpreter: Expr::Closure should always be erased by lambda_lift.rs before the interpreter runs"),
             Expr::ArrayLit(elems) => Value::Array(elems.iter().map(|e| self.eval(e)).collect()),
             Expr::Index(arr, idx) => {
                 let base = self.eval(arr);

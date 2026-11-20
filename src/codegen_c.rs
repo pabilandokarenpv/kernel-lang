@@ -157,6 +157,7 @@ impl Codegen {
                 let arr_ty = self.infer_c_type(arr, var_types);
                 array_info(&arr_ty).map(|(elem, _)| elem).unwrap_or_else(|| "long".to_string())
             }
+            Expr::Closure { .. } => unreachable!("Kernel codegen: Expr::Closure should always be erased by lambda_lift.rs before codegen runs"),
             Expr::Ident(name) => var_types.get(name).cloned().unwrap_or_else(|| "long".to_string()),
             // A borrow's C type is a pointer to whatever's being borrowed
             // (e.g. `&origin` where origin is `struct Point` -> "struct
@@ -410,6 +411,7 @@ impl Codegen {
                 }
             }
             Expr::Borrow(inner, _exclusive) => format!("(&{})", self.expr(inner, is_ptr, var_types)),
+            Expr::Closure { .. } => unreachable!("Kernel codegen: Expr::Closure should always be erased by lambda_lift.rs before codegen runs"),
             Expr::Call { name, args } => self.call_expr(name, args, is_ptr, var_types),
         }
     }

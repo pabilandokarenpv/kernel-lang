@@ -1,0 +1,19 @@
+fn main():
+    let base = 10
+    let add_base = |x: int| -> int:
+        return x + base
+
+    print(add_base(5))
+    print(add_base(100))
+
+    let mut total = 0
+    for i in 0..3:
+        let bump = |n: int| -> int:
+            return n + i
+        total += bump(1)
+    print(total)
+
+    let name = "hi"
+    let greet = |suffix: str| -> str:
+        return name + suffix
+    print(greet("!"))

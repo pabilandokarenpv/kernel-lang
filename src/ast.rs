@@ -124,6 +124,33 @@ pub enum Expr {
     // calling the freestanding `kernel_panic` halt on failure) -- no
     // compile-time bounds checking in v1.x.
     Index(Box<Expr>, Box<Expr>),
+    // Closure literal `|x: int, ...| -> ret:` + an indented block body --
+    // v1.x "basic closures," scoped deliberately narrow and erased
+    // entirely by a dedicated LAMBDA-LIFTING pass (lambda_lift.rs) between
+    // monomorphize and the checker, same "erase via AST-to-AST pass"
+    // philosophy as match/generics -- the checker/interpreter/codegen
+    // never see this variant; it's always gone before they run.
+    //   - Only ever valid as the entire value of a `let` statement (see
+    //     parser.rs's parse_stmt) -- no closures as call arguments, struct
+    //     fields, or any other expression position.
+    //   - NON-ESCAPING ONLY: the bound name may be CALLED (by name) within
+    //     the same function it was defined in (including nested blocks in
+    //     lexical scope), never passed as a value to another function,
+    //     returned, stored in a struct, etc. Referencing the name any way
+    //     other than as a call callee is a loud lambda-lift-time error --
+    //     there is no closure VALUE representation at all (no fat
+    //     pointer/env-struct machinery); the closure is converted straight
+    //     into a real top-level function with its captured free variables
+    //     as extra leading parameters, and every call site is rewritten to
+    //     pass them explicitly. This is why it can't escape: nothing
+    //     downstream of lambda-lifting ever represents "a closure," only
+    //     ordinary functions and ordinary calls.
+    //   - Captures PRIMITIVE free variables ONLY (int/float/str/bool,
+    //     always Copy) -- capturing a struct or array is a lambda-lift
+    //     error, not a silent miscompile; real capture-by-move semantics
+    //     for compound types is named future work, not implemented here.
+    //   - No recursive closures (a closure can't call itself by name).
+    Closure { params: Vec<Param>, return_ty: Option<String>, body: Vec<Stmt> },
 }
 
 #[derive(Debug, Clone)]

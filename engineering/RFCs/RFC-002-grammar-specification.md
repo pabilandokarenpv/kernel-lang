@@ -90,6 +90,19 @@ a silent miscompile.
   always decay to a C pointer (arrays can't be passed by value in C) and
   array return types are rejected at codegen time with a clear error
   (wrap in a struct instead) -- both named, not silent, limitations.
+- **Basic closures** (`let f = |x: int| -> int:` + an indented block),
+  via LAMBDA LIFTING (`lambda_lift.rs`), not a runtime closure value --
+  there's no fat-pointer/env-struct machinery at all. Every closure is
+  converted into a real top-level function (captured free variables
+  become extra leading parameters) and every call site is rewritten to
+  pass them explicitly, before the checker/interpreter/codegen ever run.
+  v1.x scope: NON-ESCAPING only (a closure can be called by name within
+  its own defining function, never passed as a value, returned, or
+  stored -- a loud lift-time error otherwise) and captures PRIMITIVE free
+  variables only (int/float/str/bool) -- capturing a struct or array is
+  also a loud lift-time error, not silent. No recursive closures.
+  Verified end to end including a real QEMU boot
+  (`examples/closures_test.kn`).
 
 ## Two run modes
 

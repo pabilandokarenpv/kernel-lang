@@ -66,6 +66,7 @@ pub enum Token {
     RBracket,
     LAngle,     // < used generically for generics is reused from Lt/Gt
     Semicolon,  // ; used only inside array types/literals: [int;5]
+    Pipe,       // | used only for closure param lists: |x: int| -> int:
 
     // structure
     Newline,
@@ -347,6 +348,7 @@ impl Lexer {
             '[' => Token::LBracket,
             ']' => Token::RBracket,
             ';' => Token::Semicolon,
+            '|' => Token::Pipe,
             other => panic!("Kernel lexer: unexpected character '{}' at pos {}", other, self.pos),
         })
     }

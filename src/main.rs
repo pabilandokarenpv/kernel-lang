@@ -2,6 +2,7 @@ mod ast;
 mod checker;
 mod codegen_c;
 mod interpreter;
+mod lambda_lift;
 mod lexer;
 mod monomorphize;
 mod parser;
@@ -52,6 +53,13 @@ fn load_checked(path: &str) -> ast::Program {
     // every generic fn/struct is replaced by one concrete, mangled copy per
     // distinct type it's actually instantiated with (see monomorphize.rs).
     let program = monomorphize::monomorphize(program);
+    // Closures (v1.x) are fully erased here too, right after generics --
+    // every closure becomes a real top-level function (its captures as
+    // extra leading params) and every call site is rewritten; see
+    // lambda_lift.rs for the full scope (non-escaping, primitive captures
+    // only). Must run before the checker for the same reason monomorphize
+    // does: nothing downstream should ever see a closure literal.
+    let program = lambda_lift::lambda_lift(program);
     let errors = Checker::new(&program).check(&program);
     if !errors.is_empty() {
         eprintln!("error: Kernel safety check failed in {}:\n", path);

@@ -276,6 +276,50 @@ impl Parser {
         FnDecl { name, is_unsafe, type_params, params, return_ty, body }
     }
 
+    // Closure literal: `|x: int, y: int| -> int:` + an indented block --
+    // see ast.rs's Expr::Closure doc comment for v1.x's scope (non-
+    // escaping, lambda-lifted away entirely before the checker runs).
+    // Param parsing deliberately mirrors parse_fn_rest's loop above (same
+    // &/&mut-stripping logic) but terminates on Pipe instead of RParen;
+    // not factored into one shared helper since the two terminators and
+    // surrounding delimiters differ enough that sharing would need its own
+    // parameter just to carry the terminator token.
+    fn parse_closure_literal(&mut self) -> Expr {
+        self.expect(Token::Pipe);
+        let mut params = Vec::new();
+        while !self.check(&Token::Pipe) {
+            let mutable = self.eat(&Token::Mut);
+            let pname = self.ident();
+            self.expect(Token::Colon);
+            let raw_ty = self.parse_type();
+            let (borrowed, rest) = match raw_ty.strip_prefix('&') {
+                Some(rest) => (true, rest.to_string()),
+                None => (false, raw_ty),
+            };
+            let (exclusive, ty) = if borrowed {
+                match rest.strip_prefix("mut ") {
+                    Some(r) => (true, r.to_string()),
+                    None => (false, rest),
+                }
+            } else {
+                (false, rest)
+            };
+            params.push(Param { name: pname, ty, borrowed, exclusive, mutable });
+            if !self.eat(&Token::Comma) {
+                break;
+            }
+        }
+        self.expect(Token::Pipe);
+        let return_ty = if self.eat(&Token::Arrow) {
+            Some(self.parse_type())
+        } else {
+            None
+        };
+        self.expect(Token::Colon);
+        let body = self.parse_block();
+        Expr::Closure { params, return_ty, body }
+    }
+
     fn parse_struct(&mut self) -> StructDecl {
         let name = self.ident();
         let type_params = self.parse_optional_type_params();
@@ -425,7 +469,16 @@ impl Parser {
                     None
                 };
                 self.expect(Token::Assign);
-                let value = self.parse_expr();
+                // A closure literal (`|params| -> ret:` + an indented
+                // block) is ONLY ever valid as the whole RHS of a `let` --
+                // see ast.rs's Expr::Closure doc comment for why -- so it's
+                // special-cased here rather than reachable from the
+                // general parse_expr()/parse_primary() chain.
+                let value = if self.check(&Token::Pipe) {
+                    self.parse_closure_literal()
+                } else {
+                    self.parse_expr()
+                };
                 Stmt::Let { name, mutable, ty, value }
             }
             Token::If => {

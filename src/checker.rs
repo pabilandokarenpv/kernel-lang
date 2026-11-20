@@ -119,6 +119,7 @@ impl Checker {
             // value, same treatment as struct construction below -- moving
             // it moves the whole array, matching real ownership semantics.
             Expr::ArrayLit(_) => false,
+            Expr::Closure { .. } => unreachable!("Kernel checker: Expr::Closure should always be erased by lambda_lift.rs before the checker runs"),
             Expr::Call { name, .. } => {
                 if self.structs.contains(name) {
                     false
@@ -379,6 +380,7 @@ impl Checker {
                     self.check_expr(e, scope, unsafe_ctx, fn_name);
                 }
             }
+            Expr::Closure { .. } => unreachable!("Kernel checker: Expr::Closure should always be erased by lambda_lift.rs before the checker runs"),
             Expr::Borrow(inner, _exclusive) => {
                 // A bare borrow expression outside a call-argument or `let`
                 // position (both handled specially below/in check_stmt) --

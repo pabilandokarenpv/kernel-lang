@@ -187,6 +187,11 @@ impl Monomorphizer {
             // a CALL/CONSTRUCTION argument's type matches a generic's sole
             // type parameter, and an array literal/index is never that.
             Expr::ArrayLit(_) | Expr::Index(..) => None,
+            // A closure literal isn't itself a value monomorphize needs to
+            // type -- it's erased by lambda_lift.rs before anything
+            // downstream (including this pass's own second sweep, since
+            // lambda-lift runs after monomorphize) ever needs its type.
+            Expr::Closure { .. } => None,
             Expr::Call { name, .. } => {
                 if self.struct_field_types.contains_key(name) {
                     Some(name.clone())
@@ -285,6 +290,19 @@ impl Monomorphizer {
                 for e in elems.iter_mut() {
                     self.rewrite_expr(e, var_types);
                 }
+            }
+            // The closure's OWN body can still call a generic function
+            // that needs monomorphizing (lambda-lift hasn't erased the
+            // closure yet at this point in the pipeline -- it runs after
+            // this pass) -- recurse into it with a scope seeded by the
+            // closure's own params, same pattern as rewrite_item for a
+            // top-level function.
+            Expr::Closure { params, body, .. } => {
+                let mut closure_vars = var_types.clone();
+                for p in params.iter() {
+                    closure_vars.insert(p.name.clone(), p.ty.clone());
+                }
+                self.rewrite_block(body, &mut closure_vars);
             }
             Expr::Borrow(inner, _) => self.rewrite_expr(inner, var_types),
             Expr::Call { name, args } => {

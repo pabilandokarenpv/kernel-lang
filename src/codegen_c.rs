@@ -43,6 +43,18 @@ pub struct Codegen {
     // needed because the AST stores a struct's own type as a plain string
     // (see ast.rs), the same representation c_type() already converts.
     struct_fields: HashMap<String, HashMap<String, String>>,
+    // Top-level `static`/`const` names -> their declared Kernel type, so
+    // Expr::Ident can resolve a GLOBAL's real type instead of falling
+    // back to "long" -- `var_types` (threaded through every statement/
+    // expression call) only ever covers function-LOCAL names (params and
+    // `let`s), so a bare global reference like `print(GREETING)` had no
+    // way to know GREETING is a `str` and silently called
+    // kernel_print_long on a pointer instead (a real, pre-existing bug,
+    // invisible until a program actually printed a global string
+    // directly -- caught by the LLVM backend's regression sweep cross-
+    // checking against this backend, not something anyone wrote a test
+    // for on purpose).
+    global_types: HashMap<String, String>,
 }
 
 impl Codegen {
@@ -50,6 +62,7 @@ impl Codegen {
         let mut structs = HashSet::new();
         let mut functions = HashMap::new();
         let mut struct_fields = HashMap::new();
+        let mut global_types = HashMap::new();
         for item in &program.items {
             match item {
                 Item::Struct(s) => {
@@ -62,10 +75,13 @@ impl Codegen {
                 Item::Function(f) => {
                     functions.insert(f.name.clone(), f.clone());
                 }
+                Item::Static { name, ty, .. } | Item::Const { name, ty, .. } => {
+                    global_types.insert(name.clone(), ty.clone());
+                }
                 _ => {}
             }
         }
-        Codegen { structs, functions, struct_fields }
+        Codegen { structs, functions, struct_fields, global_types }
     }
 
     fn c_type(&self, ty: &str) -> String {
@@ -129,8 +145,24 @@ impl Codegen {
                     "long".to_string()
                 }
             }
+            Expr::Binary(_, BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq | BinOp::And | BinOp::Or, _) => {
+                // Comparisons and logical and/or always produce a bool in
+                // both C and Kernel -- this fell through to the generic
+                // "long" catch-all below until this fix, so a `let`-bound
+                // comparison/logical RESULT later printed directly (e.g.
+                // `let ok = true && false; print(ok)`) emitted
+                // kernel_print_long on a real C `bool`, printing a raw
+                // 0/1 instead of "false"/"true" -- invisible until a
+                // program actually printed one directly rather than just
+                // using it as an `if` condition (where the 0/1-vs-bool
+                // distinction never surfaces), caught by the LLVM
+                // backend's cross-backend regression sweep producing a
+                // real output MISMATCH against this exact case.
+                "bool".to_string()
+            }
             Expr::Binary(..) => "long".to_string(),
             Expr::Unary(UnaryOp::Neg, inner) => self.infer_c_type(inner, var_types),
+            Expr::Unary(UnaryOp::Not, _) => "bool".to_string(),
             Expr::Unary(..) => "long".to_string(),
             Expr::Field(obj, field) => {
                 // Resolve the base's struct type, then look up the field's
@@ -158,7 +190,18 @@ impl Codegen {
                 array_info(&arr_ty).map(|(elem, _)| elem).unwrap_or_else(|| "long".to_string())
             }
             Expr::Closure { .. } => unreachable!("Kernel codegen: Expr::Closure should always be erased by lambda_lift.rs before codegen runs"),
-            Expr::Ident(name) => var_types.get(name).cloned().unwrap_or_else(|| "long".to_string()),
+            Expr::Ident(name) => var_types.get(name).cloned().unwrap_or_else(|| {
+                // var_types holds already-CONVERTED C type strings (e.g.
+                // "long", "const char*"); global_types (a GLOBAL
+                // static/const's name -> its RAW Kernel type string, see
+                // this struct's doc comment) needs c_type() applied here
+                // instead -- calling c_type() on var_types' values too
+                // would double-convert an already-C string and silently
+                // fall through to the "long" default for everything,
+                // which is exactly the class of bug this fix exists to
+                // remove, not reintroduce.
+                self.global_types.get(name).map(|t| self.c_type(t)).unwrap_or_else(|| "long".to_string())
+            }),
             // A borrow's C type is a pointer to whatever's being borrowed
             // (e.g. `&origin` where origin is `struct Point` -> "struct
             // Point*") -- previously this always returned "long" regardless
@@ -238,9 +281,17 @@ impl Codegen {
                     ));
                 }
                 Item::Const { name, ty, value } => {
+                    // c_type("str") already returns "const char*" -- a
+                    // second "const" prefix (one `static const` too many)
+                    // compiles fine (a harmless duplicate qualifier, not a
+                    // real bug) but is sloppy generated C; skip the extra
+                    // "const" specifically for that case.
+                    let c_ty = self.c_type(ty);
+                    let qualifier = if c_ty.starts_with("const ") { "static" } else { "static const" };
                     out.push_str(&format!(
-                        "static const {} {} = {};\n",
-                        self.c_type(ty),
+                        "{} {} {} = {};\n",
+                        qualifier,
+                        c_ty,
                         name,
                         self.expr(value, &HashMap::new(), &HashMap::new())
                     ));

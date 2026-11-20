@@ -17,6 +17,16 @@ pub enum Value {
     Bool(bool),
     Struct(String, HashMap<String, Value>),
     Array(Vec<Value>),
+    // `Vec<T>` (v1.x, INTERPRETER-ONLY so far -- real codegen support in
+    // codegen_c.rs/codegen_llvm.rs is named future work, not implemented
+    // yet). A growable collection, unlike Array's fixed compile-time
+    // size -- built via vec_new()/vec_push()/vec_get()/vec_len()/
+    // vec_set() (see eval_call). Mutation is modeled the SAME way
+    // Stmt::IndexAssign already mutates an Array: get the variable's
+    // current value, clone+mutate the clone, write the result back
+    // under the same name -- never real aliasing (this interpreter
+    // doesn't model aliasing at all, see Expr::Borrow's eval arm).
+    Vec(Vec<Value>),
     Unit,
 }
 
@@ -52,6 +62,19 @@ impl fmt::Display for Value {
             // Debug/completeness (e.g. a future caller formatting one for
             // diagnostics), matching standard array-literal notation.
             Value::Array(items) => {
+                write!(f, "[")?;
+                for (i, v) in items.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", v)?;
+                }
+                write!(f, "]")
+            }
+            // Not used by `print()` either, same restriction and same
+            // reason as Value::Array above -- codegen has no generic
+            // collection-formatter, so index/vec_get into it instead.
+            Value::Vec(items) => {
                 write!(f, "[")?;
                 for (i, v) in items.iter().enumerate() {
                     if i > 0 {
@@ -351,8 +374,8 @@ impl Interpreter {
                         // the interpreter rejects it too rather than
                         // silently diverging between the two backends --
                         // index into it (`print(arr[i])`) instead.
-                        if matches!(v, Value::Array(_)) {
-                            panic!("Kernel interpreter: `print()` on a whole array isn't supported in v1.x (matches the C codegen backend's restriction) -- index into it, e.g. `print(arr[0])`");
+                        if matches!(v, Value::Array(_) | Value::Vec(_)) {
+                            panic!("Kernel interpreter: `print()` on a whole array/Vec isn't supported in v1.x (matches the C codegen backend's restriction) -- index into it, e.g. `print(arr[0])`/`vec_get(v, 0)`");
                         }
                         v.to_string()
                     })
@@ -374,7 +397,7 @@ impl Interpreter {
                 if let Some(CallArg::Positional(e)) = args.first() {
                     let v = self.eval(e);
                     return match v {
-                        Value::Array(items) => Value::Int(items.len() as i64),
+                        Value::Array(items) | Value::Vec(items) => Value::Int(items.len() as i64),
                         // Byte length, not Unicode codepoint count -- matches
                         // the C codegen backend's kernel_strlen exactly
                         // (strlen-style, no libc/Unicode awareness available
@@ -383,11 +406,103 @@ impl Interpreter {
                         // represent (ASCII-range source text).
                         Value::Str(s) => Value::Int(s.len() as i64),
                         other => panic!(
-                            "Kernel interpreter: len() only supports arrays and strings in v1.x, found {:?}",
+                            "Kernel interpreter: len() only supports arrays, Vecs, and strings in v1.x, found {:?}",
                             other
                         ),
                     };
                 }
+            }
+            // `Vec<T>` (v1.x, INTERPRETER-ONLY -- see Value::Vec's doc
+            // comment for the full scope and why real codegen support is
+            // separate future work, not silently implied here). Every
+            // mutating builtin (vec_push/vec_set) requires its first
+            // argument to be a plain identifier (or a `&`/`&mut` borrow
+            // of one, unwrapped below) -- never an arbitrary expression
+            // -- because mutation is modeled as get-clone-mutate-set-
+            // back against that NAME, the same trick Stmt::IndexAssign
+            // already uses for arrays; there's no real aliasing to write
+            // through otherwise.
+            "vec_new" => return Value::Vec(Vec::new()),
+            "vec_len" => {
+                if let Some(arg) = args.first() {
+                    let e = match arg {
+                        CallArg::Positional(e) | CallArg::Named(_, e) => e,
+                    };
+                    return match self.eval(e) {
+                        Value::Vec(items) => Value::Int(items.len() as i64),
+                        other => panic!("Kernel interpreter: vec_len() expects a Vec, found {:?}", other),
+                    };
+                }
+            }
+            "vec_get" => {
+                if let (Some(va), Some(ia)) = (args.first(), args.get(1)) {
+                    let ve = match va {
+                        CallArg::Positional(e) | CallArg::Named(_, e) => e,
+                    };
+                    let ie = match ia {
+                        CallArg::Positional(e) | CallArg::Named(_, e) => e,
+                    };
+                    let idx = as_int(&self.eval(ie));
+                    return match self.eval(ve) {
+                        Value::Vec(items) => {
+                            if idx < 0 || idx as usize >= items.len() {
+                                panic!("Kernel interpreter: vec_get() index {} out of bounds (len {})", idx, items.len());
+                            }
+                            items[idx as usize].clone()
+                        }
+                        other => panic!("Kernel interpreter: vec_get() expects a Vec, found {:?}", other),
+                    };
+                }
+            }
+            "vec_push" | "vec_set" => {
+                let vec_name = args.first().and_then(|a| {
+                    let e = match a {
+                        CallArg::Positional(e) | CallArg::Named(_, e) => e,
+                    };
+                    // Unwrap an explicit &/&mut, if the caller wrote one
+                    // (not required -- these builtins mutate by name
+                    // regardless, same as how `print`/`len` don't
+                    // require it either -- but writing `vec_push(&mut v,
+                    // x)` to match this language's usual mutation-
+                    // signaling convention is accepted, not rejected).
+                    let unwrapped = match e {
+                        Expr::Borrow(inner, _) => inner.as_ref(),
+                        other => other,
+                    };
+                    match unwrapped {
+                        Expr::Ident(n) => Some(n.clone()),
+                        _ => None,
+                    }
+                });
+                let Some(vec_name) = vec_name else {
+                    panic!("Kernel interpreter: `{}`'s first argument must be a plain Vec variable name (optionally `&mut`-prefixed), not an arbitrary expression", name);
+                };
+                let mut items = match self.get_var(&vec_name) {
+                    Value::Vec(items) => items,
+                    other => panic!("Kernel interpreter: `{}` expects a Vec, found {:?}", name, other),
+                };
+                if name == "vec_push" {
+                    let e = match args.get(1).unwrap_or_else(|| panic!("Kernel interpreter: vec_push() requires a value argument")) {
+                        CallArg::Positional(e) | CallArg::Named(_, e) => e,
+                    };
+                    let val = self.eval(e);
+                    items.push(val);
+                } else {
+                    let ie = match args.get(1).unwrap_or_else(|| panic!("Kernel interpreter: vec_set() requires an index and a value argument")) {
+                        CallArg::Positional(e) | CallArg::Named(_, e) => e,
+                    };
+                    let ve = match args.get(2).unwrap_or_else(|| panic!("Kernel interpreter: vec_set() requires an index and a value argument")) {
+                        CallArg::Positional(e) | CallArg::Named(_, e) => e,
+                    };
+                    let idx = as_int(&self.eval(ie));
+                    let val = self.eval(ve);
+                    if idx < 0 || idx as usize >= items.len() {
+                        panic!("Kernel interpreter: vec_set() index {} out of bounds (len {})", idx, items.len());
+                    }
+                    items[idx as usize] = val;
+                }
+                self.set_var(&vec_name, Value::Vec(items));
+                return Value::Unit;
             }
             // File I/O (v1.x): INTERPRETER-ONLY, dev-mode convenience --
             // there is no filesystem at all in the C codegen backend's

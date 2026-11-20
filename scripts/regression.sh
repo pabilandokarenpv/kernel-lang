@@ -43,6 +43,24 @@ FAILURES=()
 # "mismatch" every time this script runs.
 EXPECT_PANIC=("oob_panic_demo.kn")
 
+# Files that are CORRECTLY rejected by the C backend itself (not just
+# the LLVM native one) with a real, named "Kernel codegen:" panic --
+# e.g. vec_test.kn, since Vec<T> needs a heap allocator the freestanding
+# C target doesn't have (see codegen_c.rs's vec_new/vec_push/etc. match
+# arm). Treated as a pass, same idea as LLVM's named-rejection handling
+# below, just one backend earlier.
+C_EXPECT_REJECT=("vec_test.kn")
+
+is_c_expect_reject() {
+    local base
+    base=$(basename "$1")
+    local pattern
+    for pattern in "${C_EXPECT_REJECT[@]}"; do
+        [ "$base" == "$pattern" ] && return 0
+    done
+    return 1
+}
+
 echo "=== building kernel (debug) ==="
 cargo build -q 2>&1 | grep -E "^error" && { echo "BUILD FAILED -- fix before running the sweep"; exit 1; }
 echo "build ok"
@@ -81,6 +99,25 @@ for f in examples/*.kn examples/modules/main.kn; do
     fi
 
     c_out=$(cargo run -q -- build "$f" /tmp/kn_regress_c.bin 2>&1)
+
+    if is_c_expect_reject "$f"; then
+        if echo "$c_out" | grep -q "Kernel codegen:"; then
+            reason=$(echo "$c_out" | grep -o "Kernel codegen:.*" | head -1)
+            native_out2=$(cargo run -q -- build-native "$f" /tmp/kn_regress_native 2>&1)
+            if echo "$native_out2" | grep -q "Kernel LLVM codegen:"; then
+                echo "○ $f (C correctly rejected: ${reason:0:60}...; LLVM native also correctly rejected)"
+                REJECTED=$((REJECTED + 1)); PASS=$((PASS + 1))
+            else
+                echo "✗ $f: C correctly rejected, but LLVM native did NOT (expected a named rejection too)"
+                FAIL=$((FAIL + 1)); FAILURES+=("$f: LLVM native should have rejected like C did")
+            fi
+        else
+            echo "✗ $f: expected the C backend to reject this with a named 'Kernel codegen:' panic, but it didn't"
+            FAIL=$((FAIL + 1)); FAILURES+=("$f: C backend should have rejected this")
+        fi
+        continue
+    fi
+
     c_bad=$(echo "$c_out" | grep -iE "^error|warning: passing|warning: implicit")
     if [ -n "$c_bad" ]; then
         echo "✗ $f: C backend issue: $(echo "$c_bad" | head -1)"

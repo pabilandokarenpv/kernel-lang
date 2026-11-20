@@ -507,6 +507,13 @@ impl Codegen {
                  so this can't be compiled. Use `kernel run` for programs that need it.",
                 name
             ),
+            "vec_new" | "vec_push" | "vec_get" | "vec_len" | "vec_set" => panic!(
+                "Kernel codegen: `{}` (Vec<T>) is interpreter-only in v1.x -- it needs a real heap \
+                 allocator (malloc/realloc), and the C backend's target (a freestanding kernel booting \
+                 under QEMU/real hardware) has no heap yet. Use `kernel run` for programs that need a \
+                 Vec, or a fixed-size array (`[T;N]`) if the size is known at compile time.",
+                name
+            ),
             "raw_write" => {
                 let addr = args.get(0).map(|a| self.call_arg(a, is_ptr, var_types)).unwrap_or_default();
                 let byte = args.get(1).map(|a| self.call_arg(a, is_ptr, var_types)).unwrap_or_default();

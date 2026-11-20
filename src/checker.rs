@@ -57,6 +57,15 @@ fn is_array_type(ty: &str) -> bool {
     ty.starts_with('[')
 }
 
+// `Vec<ElemType>` (v1.x, interpreter-only so far -- see
+// interpreter.rs's Value::Vec and the vec_new/vec_push/vec_get/
+// vec_len/vec_set builtins) -- same role as is_array_type, a non-Copy
+// compound type classified by its string shape rather than a real
+// type system.
+fn is_vec_type(ty: &str) -> bool {
+    ty.starts_with("Vec<")
+}
+
 #[derive(Debug, Clone)]
 struct VarState {
     copy: bool,
@@ -99,7 +108,7 @@ impl Checker {
             if let Item::Function(f) = item {
                 let mut scope: HashMap<String, VarState> = HashMap::new();
                 for p in &f.params {
-                    let copy = p.borrowed || (!self.structs.contains(&p.ty) && !is_array_type(&p.ty));
+                    let copy = p.borrowed || (!self.structs.contains(&p.ty) && !is_array_type(&p.ty) && !is_vec_type(&p.ty));
                     scope.insert(p.name.clone(), VarState { copy, moved: false, shared_borrows: 0, exclusive_borrow: false });
                 }
                 let mark = self.borrow_stack.len();
@@ -121,11 +130,16 @@ impl Checker {
             Expr::ArrayLit(_) => false,
             Expr::Closure { .. } => unreachable!("Kernel checker: Expr::Closure should always be erased by lambda_lift.rs before the checker runs"),
             Expr::Call { name, .. } => {
-                if self.structs.contains(name) {
+                if name == "vec_new" {
+                    // A freshly-built owned Vec -- same treatment as
+                    // Expr::ArrayLit above and struct construction below:
+                    // moving it moves the whole value.
+                    false
+                } else if self.structs.contains(name) {
                     false
                 } else if let Some(f) = self.functions.get(name) {
                     match &f.return_ty {
-                        Some(t) if self.structs.contains(t) || is_array_type(t) => false,
+                        Some(t) if self.structs.contains(t) || is_array_type(t) || is_vec_type(t) => false,
                         _ => true,
                     }
                 } else {
@@ -402,6 +416,32 @@ impl Checker {
                 // callers to write `len(&my_array)` just to avoid an
                 // unintended "move."
                 if name == "len" {
+                    for arg in args {
+                        let inner = match arg {
+                            CallArg::Positional(e) => e,
+                            CallArg::Named(_, e) => e,
+                        };
+                        self.check_expr(inner, scope, unsafe_ctx, fn_name);
+                    }
+                    return;
+                }
+                // Vec builtins (v1.x, interpreter-only so far -- see
+                // interpreter.rs's Value::Vec) model mutation the SAME
+                // way Stmt::IndexAssign already does for arrays: read the
+                // variable's current value, clone+mutate it, write the
+                // result back under the same name -- never real
+                // aliasing. From the CHECKER's point of view that means
+                // the Vec variable is NEVER actually consumed by any of
+                // these calls (vec_push/vec_set DO mutate it, but the
+                // program can keep using the same name afterward with
+                // its updated value, which is exactly what "not moved"
+                // means here) -- so all of them get the same move-
+                // tracking exemption len() gets, not just the read-only
+                // ones. A real function taking an actual `&mut Vec<T>`
+                // reference instead of this special-cased builtin list
+                // is future work, named here rather than silently
+                // implied equivalent.
+                if matches!(name.as_str(), "vec_new" | "vec_push" | "vec_get" | "vec_len" | "vec_set") {
                     for arg in args {
                         let inner = match arg {
                             CallArg::Positional(e) => e,

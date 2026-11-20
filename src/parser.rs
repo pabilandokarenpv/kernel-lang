@@ -96,7 +96,25 @@ impl Parser {
                 Token::Ident(name) => {
                     s.push_str(name);
                     self.advance();
-                    if depth == 0 {
+                    // A bare identifier at depth 0 is the WHOLE type
+                    // (e.g. `int`, a plain struct name) UNLESS a `<`
+                    // immediately follows, in which case this is a
+                    // generic instantiation (`Vec<int>`) and there's
+                    // more to consume -- previously this broke
+                    // unconditionally right here, so `Vec<int>` only
+                    // ever parsed as the type "Vec", leaving the
+                    // "<int>" completely unconsumed in the token stream
+                    // (surfacing downstream as a confusing "expected
+                    // Assign, found Lt" parse error at the `=` that
+                    // should have followed the whole annotation) -- a
+                    // real, previously-latent bug: nothing in the
+                    // existing example suite ever wrote an explicit
+                    // `Name<Type>` annotation (generics are always
+                    // inferred from call-site arguments instead, see
+                    // monomorphize.rs), so this path was simply never
+                    // exercised until `Vec<T>`'s `vec_new()` needed one
+                    // (there's no argument to infer T from).
+                    if depth == 0 && !matches!(self.cur(), Token::LAngle | Token::Lt) {
                         break;
                     }
                 }

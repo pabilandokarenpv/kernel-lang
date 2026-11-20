@@ -971,6 +971,13 @@ impl<'ctx> LlvmCodegen<'ctx> {
                 "Kernel LLVM codegen: `raw_write` isn't supported in the LLVM backend -- there's no MMIO \
                  on a normal userspace process -- this only makes sense for the freestanding C backend"
             ),
+            "vec_new" | "vec_push" | "vec_get" | "vec_len" | "vec_set" => panic!(
+                "Kernel LLVM codegen: `{}` (Vec<T>) isn't supported in the LLVM native backend yet in \
+                 v1.x -- interpreter-only so far (real malloc/realloc-backed codegen for it is named \
+                 future work, not a silent cross-backend disagreement). Use `kernel run` for programs \
+                 that need a Vec, or a fixed-size array (`[T;N]`) if the size is known at compile time.",
+                name
+            ),
             _ if self.structs.contains(name) => {
                 let struct_ty = self.struct_types[name];
                 let fields = &self.struct_fields[name];

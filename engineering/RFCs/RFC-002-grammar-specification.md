@@ -117,9 +117,31 @@ a silent miscompile.
   QEMU/real hardware), so `kernel build` rejects both with a clear error
   naming the real reason, rather than silently emitting a call to an
   undefined function that would only surface as a confusing linker error.
-  A real, named interpreter/codegen asymmetry, not every builtin needs
-  to exist on both backends -- but it must fail LOUDLY on the one it
-  doesn't.
+  (The LLVM native backend DOES support real file I/O, since its target
+  -- a normal host-OS process -- genuinely has a filesystem; see
+  RFC-003.)
+- **`Vec<T>`** (`vec_new()`, `vec_push`, `vec_get`, `vec_len`,
+  `vec_set`) -- a growable collection, unlike `[T;N]`'s fixed
+  compile-time size. INTERPRETER-ONLY in v1.x: both `kernel build` (no
+  heap in a freestanding kernel) and `kernel build-native` (not
+  implemented yet -- named future work, not a silent gap) reject it with
+  a clear, named error. `let v: Vec<int> = vec_new()` requires the
+  explicit `: Vec<int>` annotation because, unlike every other generic
+  in this language, there's no call-site ARGUMENT to infer the element
+  type from (`vec_new()` takes none) -- monomorphize.rs's usual
+  infer-from-arguments strategy doesn't apply here. Mutation
+  (`vec_push`/`vec_set`) is modeled the same way `Stmt::IndexAssign`
+  already mutates an array: read the named variable's current value,
+  clone+mutate, write back under the same name -- the checker
+  correspondingly treats all five `vec_*` builtins as never "moving"
+  their Vec argument (same exemption `len()` gets), so the variable
+  stays usable across repeated `vec_push` calls. Adding this surfaced
+  and fixed a real, previously-latent parser bug: `parse_type()` had
+  never actually supported `Name<Arg>` type annotations at all (it broke
+  out of its loop right after the first identifier, before ever
+  checking for a following `<`) -- nothing in the existing example suite
+  had ever written one, since every other generic in the language is
+  inferred from call-site arguments instead.
 - **A module/import system now exists**: `import foo` / `import utils.math`
   (see `modules.rs`). v1.x scope: unqualified textual splice (no
   qualified names, no pub/private visibility -- every imported item

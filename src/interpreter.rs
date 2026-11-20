@@ -271,7 +271,7 @@ impl Interpreter {
                     panic!("Kernel interpreter: field access on non-struct value");
                 }
             }
-            Expr::Borrow(e) => self.eval(e), // interpreter doesn't model aliasing, just the value
+            Expr::Borrow(e, _exclusive) => self.eval(e), // interpreter doesn't model aliasing, just the value
             Expr::Call { name, args } => self.eval_call(name, args),
         }
     }

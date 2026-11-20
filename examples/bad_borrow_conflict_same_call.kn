@@ -1,0 +1,11 @@
+struct Point:
+    x: int
+    y: int
+
+fn conflicting(a: &Point, b: &mut Point):
+    print(a.x)
+    print(b.x)
+
+fn main():
+    let origin = Point(x: 9, y: 9)
+    conflicting(&origin, &mut origin)   # ERROR: both borrows alive at once, one exclusive

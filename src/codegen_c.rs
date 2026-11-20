@@ -92,7 +92,7 @@ impl Codegen {
             Expr::Unary(..) => "long".to_string(),
             Expr::Field(..) => "long".to_string(), // v1: only primitive fields are read this way
             Expr::Ident(name) => var_types.get(name).cloned().unwrap_or_else(|| "long".to_string()),
-            Expr::Borrow(_) | Expr::Range(..) => "long".to_string(),
+            Expr::Borrow(_, _) | Expr::Range(..) => "long".to_string(),
             Expr::Call { name, args } => {
                 if name == "abs" {
                     return args.first().map(|a| match a {
@@ -268,7 +268,7 @@ impl Codegen {
             Expr::Field(obj, field) => {
                 format!("{}{}{}", self.expr(obj, is_ptr, var_types), self.accessor(obj, is_ptr), field)
             }
-            Expr::Borrow(inner) => format!("(&{})", self.expr(inner, is_ptr, var_types)),
+            Expr::Borrow(inner, _exclusive) => format!("(&{})", self.expr(inner, is_ptr, var_types)),
             Expr::Call { name, args } => self.call_expr(name, args, is_ptr, var_types),
         }
     }

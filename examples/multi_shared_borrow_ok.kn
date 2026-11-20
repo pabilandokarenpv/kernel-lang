@@ -1,0 +1,14 @@
+struct Point:
+    x: int
+    y: int
+
+fn peek(p: &Point):
+    print(p.x)
+
+fn main():
+    let origin = Point(x: 5, y: 2)
+    let r1 = &origin
+    let r2 = &origin        # fine: two shared borrows can coexist
+    peek(r1)
+    peek(r2)
+    peek(&origin)            # fine: a third shared borrow, still just reading

@@ -213,11 +213,26 @@ impl Parser {
             // registered, and codegen's fn_signature always emitted the
             // struct by value since `borrowed` here was dead/always-false).
             let raw_ty = self.parse_type();
-            let (borrowed, ty) = match raw_ty.strip_prefix('&') {
+            let (borrowed, rest) = match raw_ty.strip_prefix('&') {
                 Some(rest) => (true, rest.to_string()),
                 None => (false, raw_ty),
             };
-            params.push(Param { name: pname, ty, borrowed, mutable });
+            // &mut T in a parameter's type folds "mut " onto the string
+            // right after the stripped '&' (parse_type() emits "&mut Point"
+            // as one run) -- strip that too, same reasoning as the `&`
+            // strip above: leave `exclusive` as the single source of truth
+            // for "this is a &mut reference" rather than letting "mut "
+            // survive inside `ty` where it would break struct-name lookups
+            // exactly the way the Revision 3 bug (see ARD-003) did for `&`.
+            let (exclusive, ty) = if borrowed {
+                match rest.strip_prefix("mut ") {
+                    Some(r) => (true, r.to_string()),
+                    None => (false, rest),
+                }
+            } else {
+                (false, rest)
+            };
+            params.push(Param { name: pname, ty, borrowed, exclusive, mutable });
             if !self.eat(&Token::Comma) {
                 break;
             }
@@ -477,7 +492,8 @@ impl Parser {
             }
             Token::Amp => {
                 self.advance();
-                Expr::Borrow(Box::new(self.parse_unary()))
+                let exclusive = self.eat(&Token::Mut);
+                Expr::Borrow(Box::new(self.parse_unary()), exclusive)
             }
             _ => self.parse_postfix(),
         }

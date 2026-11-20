@@ -1,0 +1,16 @@
+struct Point:
+    x: int
+    y: int
+
+fn mutate(p: &mut Point):
+    print(p.x)
+
+fn peek(p: &Point):
+    print(p.x)
+
+fn main():
+    let origin = Point(x: 0, y: 0)
+    let r1 = &mut origin
+    let r2 = &origin        # ERROR: origin is already borrowed mutably by r1
+    peek(r2)
+    mutate(r1)

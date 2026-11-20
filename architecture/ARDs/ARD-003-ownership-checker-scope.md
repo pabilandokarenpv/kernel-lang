@@ -1,4 +1,4 @@
-# ARD-003: Ownership checker — move-checking with full control-flow merge (incl. loop re-iteration), no borrow-conflict detection yet
+# ARD-003: Ownership checker — move-checking with full control-flow merge, plus borrow-conflict detection (lexically scoped, not full NLL)
 
 **Status:** Accepted
 **Date:** 2026 (kernel-lang v1)
@@ -31,7 +31,9 @@ body being reused on pass 2 of that same loop) **is also implemented**
 (see "Revision 2" below) — the loop body is checked twice, once
 normally and once more seeded with pass 1's end state, so a value
 moved once and reused the next time around is now caught. Mutable/
-immutable borrow-conflict detection is not implemented at all in v1.
+immutable borrow-conflict detection **is also now implemented** (see
+"Revision 4" below) — lexically scoped (released at end-of-block), not
+full Non-Lexical-Lifetime analysis (released at last actual use).
 
 ## Alternatives considered
 
@@ -134,3 +136,78 @@ previous lap"). Any error that shows up only in pass 2 — not already
 present in pass 1 — is specifically a re-move-on-next-iteration bug and
 gets reported with a clarifying suffix explaining why; errors common to
 both passes are the same root cause and are not duplicated.
+
+## Revision 4: borrow-conflict detection implemented (lexically scoped, not full NLL)
+
+en explicitly asked for Kernel to become genuinely production-usable
+by others, not just a personal proof-of-concept — "no borrow-conflict
+detection" was the single most-repeated named gap across this entire
+project's ARDs, so it's the first thing tackled.
+
+**What changed, concretely**: Kernel's grammar already let `&mut T`
+*parse* as a type (the `&`/`mut` tokens were already handled by
+`parse_type()`), but neither the parser's `Param` construction nor any
+expression-level borrow ever distinguished a shared borrow (`&x`) from
+an exclusive one (`&mut x`) — there was exactly one `borrowed: bool`
+flag and one `Expr::Borrow` variant, with no concept of "kind." Worse:
+writing `&mut Point` as a parameter type would have silently hit the
+*exact same bug class* as Revision 3 above (the `"mut "` substring
+surviving inside `ty` instead of being stripped into its own flag,
+breaking the struct-name lookup) — caught and fixed as part of this
+same change, before it could ever be triggered by a real program,
+since no example used `&mut` until now.
+
+**The design**: `Expr::Borrow` gained a second field (`exclusive: bool`)
+and `Param` gained a matching `exclusive` field, both set correctly in
+the parser (mirroring exactly how `borrowed` itself was fixed in
+Revision 3 — strip the marker into a flag once, at the source, instead
+of leaving it live inside a string two different ways). `checker.rs`'s
+`VarState` gained `shared_borrows: u32` and `exclusive_borrow: bool`.
+Two kinds of borrow are tracked differently:
+
+- **Ephemeral (call-argument) borrows** — `foo(&x, &mut x)` — live only
+  for evaluating that one call's own arguments. Conflicts are checked
+  among that call's arguments plus whatever's already persistently
+  outstanding, but nothing is left registered once the call returns.
+- **Persistent (`let`-bound) borrows** — `let r = &mut x` — pushed onto
+  a `borrow_stack` and released using **lexical scoping**: a borrow is
+  "alive" from its `let` to the end of its own enclosing block (`if`
+  arm, loop body, function body), not until its actual last use the
+  way Rust's real NLL-based checker computes it (see RFC 2094, already
+  cited in COMPLETE_GUIDE.md). This is a deliberate simplification: it
+  will reject some programs a full NLL checker would accept (e.g. a
+  borrow used only in the first half of a long block, then never
+  touched again, still "counts" as alive until the block ends), but it
+  will never silently *accept* an actual live aliasing conflict — the
+  safe direction to err in, consistent with the exact same philosophy
+  already used for move-checking's conservative branch-merge (Revision
+  1, above). Full NLL (computing a borrow's real last-use point via a
+  control-flow graph) remains explicitly deferred, named future work,
+  not a silent gap.
+- **Moving a value while it's borrowed is now also an error** — `let r
+  = &origin; take(origin)` is rejected, matching Rust's real semantics:
+  you can't give away a value something else still holds a live
+  reference into.
+
+**Verified, not just implemented**: four new example programs, built
+and run through the full checker before any of this was trusted:
+`examples/bad_borrow_conflict.kn` (a `&mut` then a conflicting `&` on
+the same value — rejected), `examples/bad_borrow_conflict_same_call.kn`
+(`foo(&x, &mut x)` in one call — rejected),
+`examples/bad_move_while_borrowed.kn` (moving a value while a borrow of
+it is still alive — rejected), and
+`examples/multi_shared_borrow_ok.kn` (three simultaneous *shared*
+borrows of the same value — correctly **not** rejected, proving shared
+borrows still coexist freely). The full existing 19-example suite
+(counting the 4 new ones) was re-run through both `kernel run` and
+`kernel build` afterward — zero regressions, every previously-passing
+example still passes, every previously-rejected example is still
+rejected.
+
+- Kernel's ownership checker is now meaningfully closer to "the real
+  thing": move-checking (complete across all control-flow shapes) plus
+  borrow-conflict detection (lexically scoped) together close most of
+  the gap to a full borrow checker — the one precisely-named remaining
+  piece is NLL-style *last-use* liveness instead of *end-of-block*
+  liveness, a real but much narrower gap than "no borrow-conflict
+  detection at all."

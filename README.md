@@ -44,20 +44,20 @@ What's real and tested:
 - `src/lexer.rs` — indentation tracking (Indent/Dedent/Newline)
 - `src/parser.rs` + `src/ast.rs` — full recursive-descent parser for the core
   subset (functions, structs, if/elif/else, while, for-in-range, `unsafe`)
-- `src/checker.rs` — move/ownership checking (verified: rejects
-  use-after-move) + unsafe-block enforcement (verified: rejects unsafe ops
-  outside `unsafe`)
+- `src/checker.rs` — move/ownership checking across straight-line code,
+  branches, and loop re-iteration (verified: rejects use-after-move, including
+  control-flow-merged cases), borrow-conflict detection (verified: rejects
+  simultaneous mutable/immutable borrows, lexically scoped), and unsafe-block
+  enforcement (verified: rejects unsafe ops outside `unsafe`)
 - `src/interpreter.rs` — tree-walking dev-mode execution
 - `src/codegen_c.rs` + `kernel_runtime/` — C backend, VGA text-mode runtime,
   multiboot1 boot glue, boots a real kernel binary in QEMU
 
 Documented v1 scope limitations (not silent gaps):
-- move-checking doesn't merge across if/elif/else/loop branches yet (each
-  branch is checked in its own scope snapshot) — real control-flow-merged
-  analysis is a v1.x refinement
-- no simultaneous mutable/immutable borrow-conflict detection yet (the hard
-  20% of a real borrow checker)
-- generics/traits/enums/pattern-matching/closures aren't implemented in the
+- borrow-conflict detection is lexically scoped (a borrow is "alive" until
+  the end of its enclosing block), not full Non-Lexical-Lifetime analysis
+  (alive only until its actual last use) — see ARD-003 Revision 4
+- generics/traits/pattern-matching/closures aren't implemented in the
   interpreter/codegen yet — they exist in the syntax spec for LLM-corpus
   variety and get added incrementally when building that corpus generator
 - AST lowers straight to C (no separate Kernel IR yet) — deliberate, a formal

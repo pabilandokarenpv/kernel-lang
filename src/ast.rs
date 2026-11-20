@@ -30,8 +30,15 @@ pub struct FnDecl {
 pub struct Param {
     pub name: String,
     pub ty: String,
-    pub borrowed: bool, // &T
-    pub mutable: bool,  // mut T / self mut
+    pub borrowed: bool, // &T or &mut T
+    pub exclusive: bool, // true for &mut T, false for &T or owned T -- see
+    // checker.rs's borrow-conflict tracking (v1.x addition): this is what
+    // lets the checker distinguish a shared borrow (many allowed at once)
+    // from an exclusive one (must be the only live borrow).
+    pub mutable: bool,  // mut T / self mut -- the BINDING is reassignable;
+    // unrelated to `exclusive` above, which is about reference kind, not
+    // binding mutability. Two different concepts that happen to both use
+    // the word "mut" in source syntax.
 }
 
 #[derive(Debug, Clone)]
@@ -71,7 +78,7 @@ pub enum Expr {
     Unary(UnaryOp, Box<Expr>),
     Binary(Box<Expr>, BinOp, Box<Expr>),
     Field(Box<Expr>, String),
-    Borrow(Box<Expr>),           // &expr
+    Borrow(Box<Expr>, bool),     // &expr (false) or &mut expr (true)
     Call { name: String, args: Vec<CallArg> },
 }
 

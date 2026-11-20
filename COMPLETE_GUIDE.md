@@ -625,26 +625,34 @@ flowchart TB
 
 ---
 
-## 8. What's Implemented vs. What's Deliberately Deferred (v1 Scope)
+## 8. What's Implemented vs. What's Deliberately Deferred (v1.x Scope)
 
-Stated as plainly as the project's own internal architecture decision records (ARDs) state it — nothing here is a secret or an oversight discovered later.
+Stated as plainly as the project's own internal architecture decision records (ARDs) state it — nothing here is a secret or an oversight discovered later. **Updated from the original v1 ship**: generics, pattern matching, closures, a growable `Vec<T>`, a module system, a package manifest skeleton, a real LSP server, and a second real compiled backend (LLVM native, via `inkwell`) were all added afterward — this section reflects the CURRENT state, not the original one.
 
 ### Implemented and verified
 
 - Functions (with typed parameters and return types), structs, `if`/`elif`/`else`, `while`, `for v in lo..hi`
 - `unsafe` blocks with enforcement (rejecting raw-memory operations outside them)
-- Primitive types: `int`, `float` (arithmetic, comparison, `abs`, unary negation), `str` (concatenation via `+`/`+=`)
-- C-style enums (`enum Color: Red Green Blue` — desugars at parse time into flat named integer constants; this is deliberately *not* Rust-style tagged-union enums with associated data, which is a much bigger feature left for later)
-- Move/ownership checking, including correctly merging move-state across `if`/`elif`/`else` branches *and* detecting re-move-on-next-iteration within a single loop's own body (both added after v1's initial ship, each found and fixed by first constructing a real missed bug, not assumed as a gap)
-- Borrow-conflict detection — `&T` (shared) vs. `&mut T` (exclusive) are now distinct, and the checker rejects simultaneous conflicting borrows, as well as moving a value while it's still borrowed. Lexically scoped (a borrow is alive until the end of its enclosing block), not full Non-Lexical-Lifetime analysis — see [Section 6.1](#61-proof-borrows-really-do-become-pointers-real-generated-code) and [Section 10](#10-real-bugs-found-and-fixed-engineering-evidence-not-claims)
-- Full compile-to-bootable-binary pipeline, verified booting in QEMU with pixel-exact output matching the interpreter
+- Primitive types: `int`, `float` (arithmetic, comparison, `abs`, unary negation), `str` (concatenation via `+`/`+=`), `bool`
+- **Generics** (functions and structs) via monomorphization — inferred from call-site arguments
+- **Pattern matching** (`match`) via parse-time desugaring to `if`/`elif`
+- **Closures** via lambda-lifting (erased to plain functions + explicit captured parameters before the checker runs)
+- **Fixed-size arrays** (`[T;N]`, compile-time bounds-checked) and **`Vec<T>`**, a real growable collection backed by real `malloc`/`realloc` on the backends that have a heap (interpreter + LLVM native)
+- A **module/import system** (`import foo`/`import utils.math`) and a **package manifest skeleton** (`kernel.toml`, `kernel init`)
+- A **basic stdlib**: `len()`, `abs()`, `read_file`/`write_file`
+- C-style enums (`enum Color: Red Green Blue` — desugars at parse time into flat named integer constants; this is deliberately *not* Rust-style tagged-union enums with associated data)
+- Move/ownership checking, including correctly merging move-state across `if`/`elif`/`else` branches *and* detecting re-move-on-next-iteration within a single loop's own body
+- Borrow-conflict detection — `&T` (shared) vs. `&mut T` (exclusive) are distinct, and the checker rejects simultaneous conflicting borrows, as well as moving a value while it's still borrowed. Lexically scoped (a borrow is alive until the end of its enclosing block), not full Non-Lexical-Lifetime analysis — see [Section 6.1](#61-proof-borrows-really-do-become-pointers-real-generated-code) and [Section 10](#10-real-bugs-found-and-fixed-engineering-evidence-not-claims)
+- **THREE real, independently-verified backends**: `kernel run` (tree-walking interpreter), `kernel build` (transpile to C → real freestanding binary, boots in QEMU with pixel-exact output matching the interpreter), and `kernel build-native` (real native machine code via LLVM/`inkwell` — a real compiled executable for the host OS, not a kernel image)
+- A **real LSP server** (`kernel lsp`, hand-rolled JSON-RPC over stdio, zero external dependencies), with real, tested editor integrations for VS Code and Neovim
 
 ### Deliberately deferred, named explicitly
 
-- **Generics, traits, pattern matching, closures** — these already exist in the written grammar specification (for future corpus-generator variety) but are not implemented in the checker, interpreter, or codegen
-- **Rust-style enums with associated data (tagged unions)** — only the simpler C-style flat-constant form is implemented
+- **Traits and Rust-style enums with associated data (tagged unions)** — only the simpler C-style flat-constant enum form is implemented
 - **Full Non-Lexical-Lifetime borrow liveness** — the checker's borrow-conflict detection uses lexical (end-of-block) scoping rather than tracking each borrow's actual last use via a control-flow graph; a real, narrower gap than "no detection at all"
-- **A separate intermediate representation (IR)** between the AST and code generation — v1 lowers directly to C; an IR is planned once a second backend (LLVM, for v2) actually needs one to validate its design against
+- **A separate intermediate representation (IR)** between the AST and code generation — both backends lower directly from the checked AST; an IR remains a candidate future refactor now that a second backend genuinely exists, not yet pursued
+- **`Vec<T>` on the freestanding C backend** — no heap allocator exists in that target yet, so it's explicitly rejected there (interpreter and LLVM native both support it fully, including struct/array/nested-`Vec` element types)
+- **Cross-compilation** in `kernel build-native` — host target triple only
 
 ---
 
@@ -655,10 +663,11 @@ Stated as plainly as the project's own internal architecture decision records (A
 | Compiler implementation language | **Rust** | The language implementing a memory-safety-focused compiler is itself a credibility signal; Rust's own compiler (`cargo build`) catches accidental memory bugs in Kernel's *own* source during development, for free |
 | Build system | **Cargo** | Rust's standard build tool/package manager |
 | Lexer/Parser | Hand-written recursive descent (no parser-generator library) | Full control over error messages and indentation-sensitive tokenization; no dependency on an external grammar-definition tool |
-| Backend (v1) | Transpile to **C**, then **GCC** (compiler) + **GNU `as`** (assembler) + **GNU `ld`** (linker) | Shortest realistic path from "checked AST" to "boots in QEMU" — the actual v1 proof target |
+| Backend 1 | Transpile to **C**, then **GCC** (compiler) + **GNU `as`** (assembler) + **GNU `ld`** (linker) | Shortest realistic path from "checked AST" to "boots in QEMU" |
 | Boot standard | **Multiboot Specification** (GNU) | Lets any Multiboot-compliant bootloader (GRUB, QEMU's own loader) boot a Kernel-compiled binary with zero custom bootloader code |
 | Verification environment | **QEMU** (`qemu-system-i386`) | Free, open-source machine emulation — verifies real boot behavior without needing physical hardware |
-| Planned backend (v2) | **LLVM** via the `inkwell` Rust bindings | Native performance target once a second backend is actually being built (also when a formal IR gets introduced) |
+| Backend 2 | **LLVM** via the `inkwell` Rust bindings (LLVM 18) | Real native machine code for the host OS — this project's first and only external dependency (see `engineering/architecture/ARDs/ARD-004-llvm-dependency.md`): LLVM's instruction-selection/register-allocation/optimization pipeline is a multi-decade effort not worth reinventing to prove this project's point |
+| Dev tooling | Hand-rolled LSP server (`src/lsp.rs`) + hand-rolled JSON parsing (`src/json.rs`) | Zero dependencies for the JSON-RPC/LSP layer either — matches the project's "no external crates unless truly justified" discipline everywhere except LLVM itself |
 
 ---
 
@@ -695,13 +704,13 @@ Kernel is not claiming to be "as capable as Rust" today — it's a from-scratch 
 
 ## 12. The Long-Term Roadmap
 
-Every future stage adds a **new backend** consuming the same checked AST that v1's frontend already produces — never a fork of the frontend into a separate dialect. This is a deliberate architectural principle (see ARD-005, cited below), specifically to avoid the fragmentation problem of needing a different language per target (the exact problem Kernel is trying to solve, not recreate).
+Every future stage adds a **new backend** consuming the same checked AST that the frontend already produces — never a fork of the frontend into a separate dialect. This is a deliberate architectural principle, specifically to avoid the fragmentation problem of needing a different language per target (the exact problem Kernel is trying to solve, not recreate). **v2 (LLVM native) is no longer just planned — the first several slices are built and verified**: core language subset, arrays/string-concat, real file I/O, and a real growable `Vec<T>` (including struct/array/nested-`Vec` element types) all compile to real native machine code via `inkwell`, with output verified bit-for-bit against the interpreter.
 
 ```mermaid
 flowchart TB
-    FRONTENDNODE["Shared frontend<br/>lexer → parser → checker<br/>(the SAME checked AST for every target below)"]
-    FRONTENDNODE --> V1NODE["v1: C → gcc/as/ld<br/>Systems/kernel-level<br/>(current, complete)"]
-    FRONTENDNODE --> V2NODE["v2: LLVM (inkwell)<br/>Native performance / backend / server"]
+    FRONTENDNODE["Shared frontend<br/>lexer → parser → modules → monomorphize →<br/>lambda_lift → checker<br/>(the SAME checked AST for every target below)"]
+    FRONTENDNODE --> V1NODE["v1: C → gcc/as/ld<br/>Systems/kernel-level<br/>(complete)"]
+    FRONTENDNODE --> V2NODE["v2: LLVM (inkwell)<br/>Native performance / backend / server<br/>(IN PROGRESS — core language, arrays,<br/>strings, file I/O, Vec&lt;T&gt; all shipped)"]
     FRONTENDNODE --> V3NODE["v3: WASM<br/>Web"]
     FRONTENDNODE --> V4NODE["v4: Native FFI / WASM+WebView<br/>Mobile"]
     FRONTENDNODE --> V5NODE["v5: Kernel UI,<br/>built in Kernel itself on v3/v4<br/>Full-stack apps"]
@@ -711,14 +720,15 @@ flowchart TB
     FRONTENDNODE --> V9NODE["v9: EVM bytecode /<br/>WASM contract format<br/>Blockchain"]
 
     style V1NODE fill:#1a3a1a,stroke:#4a8,color:#fff
+    style V2NODE fill:#1a2a3a,stroke:#48a,color:#fff
 ```
 
-**Walkthrough**: the whole point of this diagram is that it's a star shape, not a chain — every one of the nine boxes connects directly back to the *same* single frontend box at the top, none of them connect to each other. That's the actual architectural commitment: adding v7 (quantum computing) doesn't touch, require, or risk breaking v3 (web), because neither of them forked the lexer/parser/checker to get their own version — they both just consume the identical checked AST that's already been validated as syntactically and ownership-safe, and each backend's own job is purely "turn this already-correct tree into *my* target format." v1 (green) is the only box that's actually built — every other box is a planned, researched target, not a parallel work-in-progress, which is also why the diagram only has one edge actually "lit up" so far.
+**Walkthrough**: the whole point of this diagram is that it's a star shape, not a chain — every one of the nine boxes connects directly back to the *same* single frontend box at the top, none of them connect to each other. That's the actual architectural commitment: adding v7 (quantum computing) doesn't touch, require, or risk breaking v3 (web), because neither of them forked the lexer/parser/checker to get their own version — they both just consume the identical checked AST that's already been validated as syntactically and ownership-safe, and each backend's own job is purely "turn this already-correct tree into *my* target format." v1 (green) is fully built; v2 (blue) has real, verified slices shipped but isn't feature-complete yet; every other box remains a planned, researched target, not a parallel work-in-progress.
 
 | Stage | Target | Backend | What it unlocks |
 |---|---|---|---|
-| **v1 (current, complete)** | Systems/kernel-level | C → gcc/as/ld | Boots a real toy kernel in QEMU; also the training-data generator for Kernel-LLM |
-| v2 | Native performance + backend/server | LLVM (`inkwell`) | Goroutine-style concurrency, `net.http`/`net.tcp`/`json`/`db` standard library, package manager |
+| **v1 (complete)** | Systems/kernel-level | C → gcc/as/ld | Boots a real toy kernel in QEMU; also the training-data generator for Kernel-LLM |
+| **v2 (in progress, real slices shipped)** | Native performance + backend/server | LLVM (`inkwell`) | Real native executables today (core language, arrays, string concat, file I/O, `Vec<T>`); goroutine-style concurrency, `net.http`/`net.tcp`/`json`/`db` standard library, and a real package manager/registry remain ahead |
 | v3 | Web | WASM | Browser + PWA support |
 | v4 | Mobile | Native FFI (iOS/Android) or WASM+WebView | Mobile apps |
 | v5 | Full-stack apps | — | "Kernel UI": a React-style component/state library, written *in* Kernel itself |
@@ -727,7 +737,7 @@ flowchart TB
 | v8 | Embedded/Arduino | C backend, `no_std`-equivalent mode | Reuses v1's exact freestanding-binary/QEMU-boot experience |
 | v9 | Blockchain | EVM bytecode / WASM contract format | A sandboxed, deterministic execution target |
 
-**v1 is the only stage in active development.** v2 through v9 are a dated, researched build plan (including real cited competitor pain-point research per target — see `product/PRDs/PRD-002-universal-language-vision.md`), not parallel or speculative work.
+**v1 is complete; v2 is the actively-developed stage with real shipped progress.** v3 through v9 remain a dated, researched build plan, not parallel or speculative work.
 
 ---
 
@@ -736,27 +746,39 @@ flowchart TB
 ```
 kernel-lang/
 ├── src/
-│   ├── lexer.rs        — tokenizes raw .kn text, tracks indentation
-│   ├── parser.rs       — recursive-descent parser, builds the AST
-│   ├── ast.rs           — AST node type definitions
-│   ├── checker.rs       — move/ownership checking + unsafe enforcement
-│   ├── interpreter.rs   — tree-walking dev-mode execution
-│   ├── codegen_c.rs     — lowers checked AST to C source
-│   └── main.rs          — CLI (tokens/run/trace/build subcommands)
+│   ├── lexer.rs          — tokenizes raw .kn text, tracks indentation
+│   ├── parser.rs         — recursive-descent parser, builds the AST
+│   ├── ast.rs             — AST node type definitions
+│   ├── modules.rs         — module/import resolution (runs first)
+│   ├── monomorphize.rs    — generics → concrete-type AST erasure
+│   ├── lambda_lift.rs     — closures → plain functions + explicit captures
+│   ├── checker.rs         — move/ownership checking + unsafe enforcement
+│   ├── interpreter.rs     — tree-walking dev-mode execution
+│   ├── codegen_c.rs       — lowers checked AST to C source (freestanding)
+│   ├── codegen_llvm.rs    — lowers checked AST to real LLVM IR/native code
+│   ├── lsp.rs             — hand-rolled LSP server (JSON-RPC over stdio)
+│   ├── json.rs            — hand-rolled JSON parsing for the LSP layer
+│   ├── manifest.rs        — kernel.toml parsing + `kernel init`
+│   └── main.rs            — CLI (run/build/build-native/lsp/init subcommands)
 ├── kernel_runtime/
-│   ├── boot.s           — x86 assembly, Multiboot header, entry point
-│   ├── link.ld          — linker script (memory layout)
-│   └── runtime.c        — VGA text-mode output driver
-├── examples/             — real .kn programs, including deliberately-
-│                           rejected ones used as checker test cases
-├── architecture/ARDs/    — Architecture Decision Records (why each
-│                           design choice was made, alternatives
-│                           considered, consequences)
-├── engineering/RFCs/     — RFC-001 (system architecture), RFC-002
-│                           (full grammar specification)
-└── product/PRDs/         — PRD-001 (original roadmap), PRD-002
-                            (expanded vision + researched competitor
-                            pain points, cited per target)
+│   ├── boot.s            — x86 assembly, Multiboot header, entry point
+│   ├── link.ld           — linker script (memory layout)
+│   └── runtime.c         — VGA text-mode output driver, kernel_panic, kernel_strcat
+├── editors/
+│   ├── vscode/            — packaged, tested VS Code extension
+│   └── nvim/              — tested Neovim LSP config
+├── examples/              — real .kn programs, including deliberately-
+│                            rejected ones used as checker test cases
+├── scripts/
+│   └── regression.sh      — automated 3-backend regression sweep
+├── engineering/
+│   ├── architecture/ARDs/ — Architecture Decision Records
+│   └── RFCs/              — RFC-001 (system architecture), RFC-002
+│                            (grammar specification), RFC-003 (LLVM
+│                            native backend)
+└── product/PRDs/          — PRD-001 (original roadmap), PRD-002
+                             (expanded vision + researched competitor
+                             pain points, cited per target)
 ```
 
 ---
@@ -765,12 +787,13 @@ kernel-lang/
 
 Stated as directly as everywhere else in this document:
 
-- **Only `int`, `float`, and `str` are real primitive types in v1** — no generics, no traits, no pattern matching, no closures, despite these already existing in the written grammar specification for future use.
+- **Generics, pattern matching, and closures ARE implemented** (v1.x additions after the original v1 ship) — but traits and Rust-style tagged-union enums with associated data are not (only the simpler C-style flat-constant enum form is).
 - **Borrow-conflict detection is lexically scoped, not full NLL.** A borrow is "alive" until the end of its enclosing block, not just until its actual last use the way Rust's modern checker computes it via a real control-flow graph — real conflicts are always caught, but some programs a full NLL checker would accept are rejected too.
-- **Only C-style enums**, not Rust-style tagged unions with associated data.
-- **No intermediate representation (IR)** between the checked AST and C code generation — a real, acknowledged simplification that will need addressing once a second backend (LLVM, v2) exists.
-- **String concatenation uses a fixed rotating pool of 8 static 256-byte buffers**, not real dynamic allocation — there's no heap in this freestanding environment, so a 9th concurrently-"alive" concatenation result silently overwrites the oldest one still in use. Real, documented ([Section 7.2](#72-the-freestanding-runtimes-real-limitations)), not discovered by accident.
-- **v1 targets a specific, narrow proof** (boots in QEMU, pixel-exact vs. the interpreter) — it is explicitly not a production-ready systems language yet, and the roadmap beyond v1 (backend/web/mobile/full-stack/ML/quantum/embedded/blockchain) is a researched plan, not built or tested.
+- **No intermediate representation (IR)** between the checked AST and either backend's code generation — a real, acknowledged simplification; a second backend (LLVM native) now genuinely exists and could motivate introducing one, but it hasn't been pursued yet.
+- **String concatenation on the C/freestanding backend** uses a fixed rotating pool of 8 static 256-byte buffers, not real dynamic allocation — there's no heap in that freestanding environment, so a 9th concurrently-"alive" concatenation result silently overwrites the oldest one still in use. Real, documented, not discovered by accident. (The LLVM native backend, which targets a normal OS process with a real heap, does real `malloc`/`strcpy`/`strcat`-backed concatenation instead — no such limit there.)
+- **`Vec<T>` has no codegen on the freestanding C backend** (no heap allocator exists in that target) — rejected there with a clear, named error; fully supported on the interpreter and the LLVM native backend, including struct/array/nested-`Vec` element types.
+- **`kernel build-native` has no cross-compilation** — host target triple only.
+- **v1.x targets real, verified capability, but is still not a production-ready systems language** — the roadmap beyond the current state (web/mobile/full-stack/ML/quantum/embedded/blockchain) is a researched plan, not built or tested.
 
 None of this is hidden in a separate document only engineers would find — it's stated in this same guide, matching the honesty standard applied throughout this project's own architecture decision records.
 

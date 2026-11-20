@@ -1,0 +1,50 @@
+{
+  "name": "kernel-lang",
+  "displayName": "Kernel Language",
+  "description": "Syntax highlighting + real LSP diagnostics for Kernel (.kn), a from-scratch systems language with real move/borrow checking, generics, closures, and three verified backends (interpreter, freestanding C, native LLVM).",
+  "version": "0.1.0",
+  "publisher": "kernel-lang",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pabilandokarenpv/kernel-lang.git"
+  },
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": ["Programming Languages"],
+  "activationEvents": ["onLanguage:kernel"],
+  "main": "./extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "kernel",
+        "aliases": ["Kernel", "kernel"],
+        "extensions": [".kn"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "kernel",
+        "scopeName": "source.kernel",
+        "path": "./syntaxes/kernel.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "Kernel",
+      "properties": {
+        "kernel.serverPath": {
+          "type": "string",
+          "default": "kernel",
+          "description": "Path to the `kernel` compiler binary (must support the `lsp` subcommand). Defaults to `kernel` on PATH -- build the compiler (`cargo build --release` in the kernel-lang repo) and either add target/release to PATH or set this to the full binary path."
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^2.32.0"
+  }
+}

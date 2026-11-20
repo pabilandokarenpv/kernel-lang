@@ -180,6 +180,23 @@ Honest v1.x scope:
   process -- verified against both a syntax error and a checker error in
   a real stdio JSON-RPC session (see `tests/test_lsp.py`).
 
+### Real editor integration: `editors/vscode/`
+
+Because `kernel lsp` is a real, standard LSP server (JSON-RPC over
+stdio), ANY LSP-capable editor can use it -- Neovim, Helix, Sublime,
+Emacs just need a few lines of client config pointing at the binary. A
+packaged VS Code extension lives at `editors/vscode/` (syntax
+highlighting via a TextMate grammar matching the real keyword table in
+`lexer.rs`, plus the LSP client wiring) -- see its own README for setup.
+Verified it packages into a real, valid, installable `.vsix` (confirmed
+via `file`/`unzip -l`, with `vscode-languageclient` and its transitive
+deps correctly bundled, not just referenced), AND verified the actual
+wire protocol against a real npm LSP transport library (`vscode-
+jsonrpc`, not just a hand-rolled test script) spawning the real `kernel
+lsp` binary: `initialize` returns the right capabilities, a valid
+program gets zero diagnostics, an invalid one gets a real diagnostic
+with the real message and position.
+
 ## Why this grammar shape
 
 The indentation-based syntax with an explicit ownership model and a

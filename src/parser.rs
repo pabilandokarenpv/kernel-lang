@@ -9,6 +9,14 @@ pub struct Parser {
     pos: usize,
 }
 
+// Intermediate result of parse_match_pattern() -- never part of the AST
+// itself (see parse_match_desugared's doc comment), just the parser's
+// own two-case split before each case lowers to real Stmt/Expr nodes.
+enum MatchPattern {
+    Value(Expr),
+    EnumVariant(String, Vec<String>), // variant name, positional field bindings (or "_" to skip)
+}
+
 impl Parser {
     pub fn new(tokens: Vec<(Token, usize, usize)>) -> Self {
         Parser { tokens, pos: 0 }
@@ -33,6 +41,17 @@ impl Parser {
 
     fn check(&self, t: &Token) -> bool {
         self.cur() == t
+    }
+
+    // The token AFTER the current one, without consuming anything --
+    // needed for match-pattern parsing's one bit of real lookahead:
+    // "is this ident immediately followed by `(`" distinguishes an
+    // enum-variant pattern (`Circle(r)`) from a plain value pattern
+    // (`Circle` used as an old-style flat-const, or a bare literal) at
+    // PARSE time, with no symbol table required (see EnumDecl's doc
+    // comment in ast.rs for why this matters).
+    fn peek(&self) -> &Token {
+        self.tokens.get(self.pos + 1).map(|t| &t.0).unwrap_or(&Token::Eof)
     }
 
     fn eat(&mut self, t: &Token) -> bool {
@@ -160,7 +179,7 @@ impl Parser {
         self.skip_newlines();
         while !self.check(&Token::Eof) {
             if self.check(&Token::Enum) {
-                items.extend(self.parse_enum_desugared());
+                items.extend(self.parse_enum());
             } else {
                 items.push(self.parse_item());
             }
@@ -171,37 +190,58 @@ impl Parser {
 
     /// `enum Color:` / `    Red` / `    Green` desugars to plain `const`
     /// int items (`const Red: int = 0`, `const Green: int = 1`, ...) —
-    /// deliberately C-style (a named integer constant, no associated
-    /// data/tagged union) so it needs zero changes to the checker,
-    /// interpreter, or codegen: those already handle `Item::Const`
-    /// correctly, an enum variant just IS an int under the hood. Full
-    /// Rust-style enums with associated data and pattern matching remain
-    /// out of v1's scope (ARD-001) — this gives real enum ergonomics
-    /// (named constants, no magic numbers) without that larger lift.
-    fn parse_enum_desugared(&mut self) -> Vec<Item> {
+    /// Parses an `enum` declaration. If EVERY variant has zero fields,
+    /// desugars to the OLD, pre-existing flat-int-const form (one
+    /// `Item::Const` per variant, 0/1/2/...) exactly as before -- needs
+    /// zero changes to the checker/interpreter/codegen, and keeps every
+    /// pre-existing pure-C-style-enum example working byte-for-byte
+    /// identically. If ANY variant carries at least one field, emits a
+    /// single real `Item::Enum` instead -- see EnumDecl's doc comment in
+    /// ast.rs for the full tagged-union design and its honest v1.x scope.
+    fn parse_enum(&mut self) -> Vec<Item> {
         self.expect(Token::Enum);
-        let _name = self.ident(); // the enum's own name isn't needed once desugared to flat consts
+        let name = self.ident();
         self.expect(Token::Colon);
         self.expect(Token::Newline);
         self.expect(Token::Indent);
-        let mut items = Vec::new();
-        let mut next_value: i64 = 0;
+        let mut variants: Vec<(String, Vec<String>)> = Vec::new();
         loop {
             self.skip_newlines();
             if self.check(&Token::Dedent) {
                 break;
             }
             let variant_name = self.ident();
-            items.push(Item::Const {
-                name: variant_name,
-                ty: "int".to_string(),
-                value: Expr::Int(next_value),
-            });
-            next_value += 1;
+            let mut fields = Vec::new();
+            if self.eat(&Token::LParen) {
+                while !self.check(&Token::RParen) {
+                    fields.push(self.parse_type());
+                    if !self.eat(&Token::Comma) {
+                        break;
+                    }
+                }
+                self.expect(Token::RParen);
+            }
+            variants.push((variant_name, fields));
             self.skip_newlines();
         }
         self.expect(Token::Dedent);
-        items
+
+        if variants.iter().all(|(_, fields)| fields.is_empty()) {
+            // Pure C-style enum -- the old desugar, unchanged.
+            let mut items = Vec::new();
+            let mut next_value: i64 = 0;
+            for (variant_name, _) in variants {
+                items.push(Item::Const {
+                    name: variant_name,
+                    ty: "int".to_string(),
+                    value: Expr::Int(next_value),
+                });
+                next_value += 1;
+            }
+            items
+        } else {
+            vec![Item::Enum(EnumDecl { name, variants })]
+        }
     }
 
     fn parse_item(&mut self) -> Item {
@@ -412,13 +452,23 @@ impl Parser {
     // "erase via AST-to-AST pass" philosophy as C-style enum desugaring
     // above, just done inline here instead of a separate pass, since the
     // target (If) already exists and needs zero changes to the
-    // checker/interpreter/codegen. Each arm becomes `scrutinee == pattern`;
-    // `_` becomes the else branch.
+    // checker/interpreter/codegen for the plain-value-pattern case (the
+    // enum-variant-pattern case below adds Expr::EnumTag/EnumVariantTag/
+    // EnumField, three small new Expr nodes, but still produces ordinary
+    // Stmt::If/Stmt::Let underneath -- control flow itself is still 100%
+    // erased, only the new VALUE representation needed real plumbing,
+    // same split Vec<T> already established). Each plain-value arm
+    // becomes `scrutinee == pattern`; an enum-variant arm becomes a tag
+    // comparison plus one synthesized `let` per field binding; `_`
+    // becomes the else branch.
     //
     // Honest v1.x scope (named gaps, not silent ones):
-    //   - Patterns are int/bool literals or bare idents (e.g. enum consts)
-    //     only -- no destructuring, no struct/array patterns, no guards,
-    //     no or-patterns (`a | b`).
+    //   - Plain-value patterns are int/bool literals or bare idents (e.g.
+    //     old-style flat enum consts) only -- no struct/array patterns,
+    //     no guards, no or-patterns (`a | b`).
+    //   - Enum-variant patterns (`Circle(r)`) bind EVERY field positionally
+    //     to a fresh name, or `_` to skip one -- no nested patterns inside
+    //     a binding position.
     //   - String literal patterns are rejected with a clear parse error:
     //     `==` on `str` is still POINTER equality in the C codegen backend
     //     (a separate, pre-existing gap -- see codegen_c.rs's `binop`,
@@ -460,8 +510,37 @@ impl Parser {
                 let pattern = self.parse_match_pattern();
                 self.expect(Token::Colon);
                 let body = self.parse_block();
-                let cond = Expr::Binary(Box::new(scrutinee.clone()), BinOp::Eq, Box::new(pattern));
-                arms.push((cond, body));
+                match pattern {
+                    MatchPattern::Value(e) => {
+                        let cond = Expr::Binary(Box::new(scrutinee.clone()), BinOp::Eq, Box::new(e));
+                        arms.push((cond, body));
+                    }
+                    MatchPattern::EnumVariant(variant_name, binds) => {
+                        let cond = Expr::Binary(
+                            Box::new(Expr::EnumTag(Box::new(scrutinee.clone()))),
+                            BinOp::Eq,
+                            Box::new(Expr::EnumVariantTag(variant_name.clone())),
+                        );
+                        // One synthesized `let` per non-`_` binding,
+                        // extracting that positional field BEFORE the
+                        // arm's own body runs -- `_` skips the binding
+                        // entirely (no unused-variable churn for a field
+                        // the arm doesn't care about).
+                        let mut full_body = Vec::new();
+                        for (i, bind_name) in binds.iter().enumerate() {
+                            if bind_name != "_" {
+                                full_body.push(Stmt::Let {
+                                    name: bind_name.clone(),
+                                    mutable: false,
+                                    ty: None,
+                                    value: Expr::EnumField(Box::new(scrutinee.clone()), variant_name.clone(), i),
+                                });
+                            }
+                        }
+                        full_body.extend(body);
+                        arms.push((cond, full_body));
+                    }
+                }
             }
             self.skip_newlines();
         }
@@ -469,7 +548,32 @@ impl Parser {
         Stmt::If { arms, else_body }
     }
 
-    fn parse_match_pattern(&mut self) -> Expr {
+    fn parse_match_pattern(&mut self) -> MatchPattern {
+        // An ident immediately followed by `(` is ALWAYS an enum-variant
+        // pattern (`Circle(r)`, `Empty()`) -- syntactically unambiguous
+        // with no symbol table needed, since no plain-value pattern ever
+        // looks like this (see EnumDecl's doc comment in ast.rs for why
+        // a MIXED enum's variants -- including zero-field ones -- always
+        // use call-shaped syntax, in both construction and pattern).
+        if let Token::Ident(name) = self.cur().clone() {
+            if *self.peek() == Token::LParen {
+                self.advance(); // variant name
+                self.expect(Token::LParen);
+                let mut binds = Vec::new();
+                while !self.check(&Token::RParen) {
+                    binds.push(self.ident());
+                    if !self.eat(&Token::Comma) {
+                        break;
+                    }
+                }
+                self.expect(Token::RParen);
+                return MatchPattern::EnumVariant(name, binds);
+            }
+        }
+        MatchPattern::Value(self.parse_match_value_pattern())
+    }
+
+    fn parse_match_value_pattern(&mut self) -> Expr {
         match self.cur().clone() {
             Token::Int(n) => {
                 self.advance();

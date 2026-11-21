@@ -1,0 +1,6 @@
+enum Shape:
+    Circle(int)
+
+fn main():
+    let c = Circle(5, 6)
+    print(1)

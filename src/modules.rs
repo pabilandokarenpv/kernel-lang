@@ -94,6 +94,7 @@ fn check_for_duplicate_names(items: &[Item]) {
             Item::Function(f) => &f.name,
             Item::Struct(s) => &s.name,
             Item::Static { name, .. } | Item::Const { name, .. } => name,
+            Item::Enum(e) => &e.name,
             Item::Import(_) => continue, // already resolved away by this point
         };
         *seen.entry(name.as_str()).or_insert(0) += 1;

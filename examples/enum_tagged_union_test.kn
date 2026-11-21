@@ -1,0 +1,26 @@
+enum Shape:
+    Circle(int)
+    Square(int)
+    Rect(int, int)
+    Empty()
+
+fn area(s: Shape) -> int:
+    match s:
+        Circle(r):
+            return 3 * r * r
+        Square(side):
+            return side * side
+        Rect(w, h):
+            return w * h
+        Empty():
+            return 0
+
+fn main():
+    let c = Circle(5)
+    let sq = Square(4)
+    let r = Rect(3, 7)
+    let e = Empty()
+    print(area(c))
+    print(area(sq))
+    print(area(r))
+    print(area(e))

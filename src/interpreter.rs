@@ -27,6 +27,15 @@ pub enum Value {
     // under the same name -- never real aliasing (this interpreter
     // doesn't model aliasing at all, see Expr::Borrow's eval arm).
     Vec(Vec<Value>),
+    // A real tagged-union enum value (v1.x) -- see EnumDecl's doc
+    // comment in ast.rs. `String` is the VARIANT's own name (not the
+    // enum's -- variant names are globally unique by design, see
+    // EnumDecl's doc comment, so this alone is enough to print/identify
+    // it without needing a separate lookup table at Display time);
+    // `usize` is its declared tag index (what EnumTag reads); `Vec<Value>`
+    // is its positional payload fields (always primitives, see
+    // EnumDecl's scope note -- empty for a zero-field variant).
+    Enum(String, usize, Vec<Value>),
     Unit,
 }
 
@@ -84,6 +93,20 @@ impl fmt::Display for Value {
                 }
                 write!(f, "]")
             }
+            Value::Enum(variant_name, _tag, fields) => {
+                write!(f, "{}", variant_name)?;
+                if !fields.is_empty() {
+                    write!(f, "(")?;
+                    for (i, v) in fields.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{}", v)?;
+                    }
+                    write!(f, ")")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -118,6 +141,14 @@ pub struct Interpreter {
     // separate, narrower, still-real gap, not fixed here (would need
     // threading alias info across the call boundary itself).
     ref_aliases: Vec<HashMap<String, String>>,
+    // Real tagged-union enums (v1.x) -- see EnumDecl's doc comment in
+    // ast.rs. Same split as checker.rs's own enums/variant_info fields:
+    // `enums` for the declarations themselves, `variant_info` as the
+    // flattened GLOBAL variant-name -> (enum name, index, field types)
+    // lookup every variant construction/EnumTag/EnumField/
+    // EnumVariantTag resolves through.
+    enums: HashMap<String, EnumDecl>,
+    variant_info: HashMap<String, (String, usize, Vec<String>)>,
     pub trace: Vec<String>,  // execution trace: lets, assigns, branches taken
     pub output: Vec<String>, // captured `print` lines (one entry per print statement)
 }
@@ -130,6 +161,8 @@ impl Interpreter {
             globals: HashMap::new(),
             scopes: Vec::new(),
             ref_aliases: Vec::new(),
+            enums: HashMap::new(),
+            variant_info: HashMap::new(),
             trace: Vec::new(),
             output: Vec::new(),
         }
@@ -143,6 +176,12 @@ impl Interpreter {
                 }
                 Item::Struct(s) => {
                     self.structs.insert(s.name.clone(), s.clone());
+                }
+                Item::Enum(e) => {
+                    for (idx, (variant_name, field_types)) in e.variants.iter().enumerate() {
+                        self.variant_info.insert(variant_name.clone(), (e.name.clone(), idx, field_types.clone()));
+                    }
+                    self.enums.insert(e.name.clone(), e.clone());
                 }
                 Item::Static { name, value, .. } | Item::Const { name, value, .. } => {
                     let v = self.eval(value);
@@ -452,6 +491,35 @@ impl Interpreter {
                     other => panic!("Kernel interpreter: indexing into a non-array value {:?}", other),
                 }
             }
+            Expr::EnumTag(e) => {
+                match self.eval(e) {
+                    Value::Enum(_, tag, _) => Value::Int(tag as i64),
+                    other => panic!("Kernel interpreter: EnumTag on a non-enum value {:?}", other),
+                }
+            }
+            Expr::EnumVariantTag(variant_name) => {
+                let (_, idx, _) = self.variant_info.get(variant_name).unwrap_or_else(|| {
+                    panic!("Kernel interpreter: unknown enum variant `{}`", variant_name)
+                });
+                Value::Int(*idx as i64)
+            }
+            Expr::EnumField(e, variant_name, idx) => {
+                match self.eval(e) {
+                    Value::Enum(actual_variant, _, fields) => {
+                        if actual_variant != *variant_name {
+                            panic!(
+                                "Kernel interpreter: EnumField expected variant `{}`, found `{}` -- this should \
+                                 always be guarded by a matching EnumTag check first (a real match-desugar bug if reached)",
+                                variant_name, actual_variant
+                            );
+                        }
+                        fields.get(*idx).cloned().unwrap_or_else(|| {
+                            panic!("Kernel interpreter: variant `{}` has no field at index {}", variant_name, idx)
+                        })
+                    }
+                    other => panic!("Kernel interpreter: EnumField on a non-enum value {:?}", other),
+                }
+            }
             Expr::Call { name, args } => self.eval_call(name, args),
         }
     }
@@ -475,8 +543,8 @@ impl Interpreter {
                         // the interpreter rejects it too rather than
                         // silently diverging between the two backends --
                         // index into it (`print(arr[i])`) instead.
-                        if matches!(v, Value::Array(_) | Value::Vec(_)) {
-                            panic!("Kernel interpreter: `print()` on a whole array/Vec isn't supported in v1.x (matches the C codegen backend's restriction) -- index into it, e.g. `print(arr[0])`/`vec_get(v, 0)`");
+                        if matches!(v, Value::Array(_) | Value::Vec(_) | Value::Enum(..)) {
+                            panic!("Kernel interpreter: `print()` on a whole array/Vec/enum isn't supported in v1.x (matches the C codegen backend's restriction) -- index into it, e.g. `print(arr[0])`/`vec_get(v, 0)`, or match on an enum and print its extracted fields");
                         }
                         v.to_string()
                     })
@@ -672,6 +740,19 @@ impl Interpreter {
                 }
             }
             return Value::Struct(name.to_string(), fields);
+        }
+
+        // enum variant construction, e.g. Circle(5), Empty() -- see
+        // EnumDecl's doc comment in ast.rs. Positional only, matches
+        // the checker's own validation.
+        if let Some((_, idx, _)) = self.variant_info.get(name).cloned() {
+            let fields: Vec<Value> = args
+                .iter()
+                .map(|a| match a {
+                    CallArg::Positional(e) | CallArg::Named(_, e) => self.eval(e),
+                })
+                .collect();
+            return Value::Enum(name.to_string(), idx, fields);
         }
 
         // user-defined function call, positional args bound to params in order

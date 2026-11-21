@@ -33,6 +33,7 @@ pub fn lambda_lift(program: Program) -> Program {
             Item::Function(f) => Some(f.name.clone()),
             Item::Struct(s) => Some(s.name.clone()),
             Item::Static { name, .. } | Item::Const { name, .. } => Some(name.clone()),
+            Item::Enum(e) => Some(e.name.clone()),
             Item::Import(_) => unreachable!("Kernel lambda-lift: Item::Import should always be resolved by modules.rs before this runs"),
         })
         .collect();
@@ -239,6 +240,9 @@ impl<'a> Lifter<'a> {
             }
             Expr::Field(obj, _) => self.rewrite_expr(obj, closures),
             Expr::Borrow(inner, _) => self.rewrite_expr(inner, closures),
+            Expr::EnumTag(e) => self.rewrite_expr(e, closures),
+            Expr::EnumVariantTag(_) => {}
+            Expr::EnumField(e, _, _) => self.rewrite_expr(e, closures),
             Expr::Index(arr, idx) => {
                 self.rewrite_expr(arr, closures);
                 self.rewrite_expr(idx, closures);
@@ -338,6 +342,9 @@ impl<'a> Lifter<'a> {
             }
             Expr::Field(obj, _) => self.find_free_in_expr(obj, bound, seen, free),
             Expr::Borrow(inner, _) => self.find_free_in_expr(inner, bound, seen, free),
+            Expr::EnumTag(e) => self.find_free_in_expr(e, bound, seen, free),
+            Expr::EnumVariantTag(_) => {}
+            Expr::EnumField(e, _, _) => self.find_free_in_expr(e, bound, seen, free),
             Expr::Index(arr, idx) => {
                 self.find_free_in_expr(arr, bound, seen, free);
                 self.find_free_in_expr(idx, bound, seen, free);

@@ -166,14 +166,38 @@ a silent miscompile.
   one concrete, mangled copy generated per distinct type actually used at
   a call site. Single type parameter inferred; a second parameter in
   `fn pair<T, U>` parses but isn't substituted yet (named future work).
-- **`match`** desugars entirely to `if`/`elif`/`else` at parse time (same
-  "erase the feature before the checker/interpreter/codegen see it"
-  approach as C-style enums below). v1.x patterns are int/bool literals
-  or bare idents (enum consts) only, no destructuring/guards/or-patterns;
+- **`match`** desugars entirely to `if`/`elif`/`else`/`let` at parse time
+  (same "erase the feature before the checker/interpreter/codegen see it"
+  approach as C-style enums below, extended for tagged-union variant
+  patterns -- see the new "Tagged-union enums" entry below for the
+  `Circle(r)`-style pattern, which still desugars entirely at parse
+  time, just via 3 new small `Expr` nodes (`EnumTag`/`EnumVariantTag`/
+  `EnumField`) instead of a bare `==` comparison). v1.x plain-value
+  patterns are int/bool literals or bare idents (old-style flat enum
+  consts) only, no struct/array destructuring/guards/or-patterns;
   string patterns are a parse error (`==` on `str` is pointer-equality in
   the C backend, a separate pre-existing gap) rather than a silent
   miscompile. Scrutinee must be a plain ident/field access (re-evaluated
   per arm, so no call-expression scrutinee).
+- **Tagged-union enums** (`enum Shape: Circle(int) / Square(int) /
+  Rect(int, int)`), a REAL runtime type (not erased, same treatment
+  `Vec<T>` got) -- construction is always call syntax (`Circle(5)`,
+  `Empty()` even for a zero-field variant, see EnumDecl's doc comment in
+  ast.rs for why), and `match` patterns bind fields positionally
+  (`Circle(r):`, `_` to skip a binding). If EVERY variant of an `enum`
+  has zero fields, it's still handled by the OLD, unchanged flat-int-
+  const desugar (`examples/enums.kn`/`match_test.kn` keep working
+  byte-for-byte identically) -- this is purely additive. Honest v1.x
+  scope: payload fields are primitives only (int/float/str/bool, no
+  struct/array/Vec/nested-enum payloads -- every backend's fixed-width
+  tagged-union layout depends on this); variant names must be globally
+  unique across the whole program (no `::` paths to disambiguate);
+  move-by-default (non-Copy), exactly like structs; no exhaustiveness
+  checking. Real, verified support on all THREE backends (interpreter,
+  C/QEMU via a real C `union`, LLVM native via raw i64-slot storage with
+  no cast needed thanks to opaque pointers) -- see RFC-003 for the
+  native-backend layout detail. Verified end to end including a real
+  QEMU boot (`examples/enum_tagged_union_test.kn`).
 - **Fixed-size arrays** (`[int;5]`, literals `[1, 2, 3]`, indexing
   `arr[i]`/`arr[i] = v`). No dynamic-length slices/Vec yet (a real future
   lift: fat pointer + length, heap/arena allocation). Bounds-checked at

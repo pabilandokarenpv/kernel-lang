@@ -115,6 +115,28 @@ examples run unchanged, the rest are the named gaps below):
   element types, and the out-of-bounds panic path.
 - Top-level `static`/`const` (including desugared enum variants) as real
   LLVM globals.
+- **Tagged-union enums** (v1.x, real on all three backends -- see RFC-002
+  for the language-level design). This backend's runtime layout: every
+  enum shares ONE LLVM struct shape, `{ tag: i64, data: [max_arity x
+  i64] }`, where `max_arity` is the largest field count across EVERY
+  enum variant in the whole program (a single global max, not per-enum
+  -- a handful of wasted slots on a small-arity enum costs nothing real
+  here, same simplification codegen_c.rs's C `union`-based layout makes
+  too). Each field value is squeezed down to a raw i64 bit pattern
+  before insertion (`enum_slot_to_i64`: int as-is, bool zero-extends,
+  float/str reinterpret their bits via `bitcast`/`ptrtoint`) and
+  reconstructed the same way on extraction (`enum_slot_from_i64`) --
+  NOT a real C-style `union` (LLVM has no such type), but functionally
+  equivalent: since every supported payload type here is exactly 8
+  bytes or narrower (see EnumDecl's primitive-only scope in ast.rs) and
+  LLVM 15+ pointers are opaque, no actual pointer-cast is ever needed to
+  load/store a DIFFERENT real type through the same i64-typed slot
+  address. Construction builds the `{ tag, data[] }` aggregate purely
+  via `insert_value` chains (no alloca needed), the exact same SSA-
+  register approach struct-literal construction already used. Verified
+  bit-for-bit against the interpreter across multi-field variants, a
+  zero-field variant, and `_`-skipped pattern bindings
+  (`examples/enum_tagged_union_test.kn`).
 - REAL short-circuit `&&`/`||` (actual branching + a phi, not a simple
   bitwise and/or) -- deliberately not simpler-than-necessary here, since
   C's `&&`/`||` (what `codegen_c.rs` emits) really does short-circuit,

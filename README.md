@@ -110,9 +110,15 @@ $ kernel init myproject                        # scaffold a new project (kernel.
 
 ### Documented scope limitations (not silent gaps)
 
-- Borrow-conflict detection is lexically scoped (a borrow is "alive" until
-  the end of its enclosing block), not full Non-Lexical-Lifetime analysis.
-- Traits and Rust-style tagged-union enums remain unimplemented.
+- Borrow-conflict detection has a real (if deliberately partial) Non-
+  Lexical-Lifetime improvement: a persistent borrow is released right
+  after its actual last use within its own block, not always held to
+  the end of the enclosing block -- full path-sensitive liveness (live
+  only through the exact branch taken) remains future work.
+- Traits remain unimplemented. Rust-style tagged-union enums (variants
+  with typed payload fields) ARE implemented, real on all three
+  backends -- scoped to primitive-only payload fields and globally-
+  unique variant names (no `::` paths to disambiguate).
 - `Vec<T>` has no codegen on the freestanding C backend (no heap allocator
   in a kernel with no allocator yet) — interpreter and LLVM native both
   support it fully, including struct/array/nested-`Vec` element types.

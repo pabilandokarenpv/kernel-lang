@@ -1,0 +1,7 @@
+enum A:
+    X(int)
+enum B:
+    X(int)
+
+fn main():
+    print(1)

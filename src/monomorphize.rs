@@ -305,6 +305,9 @@ impl Monomorphizer {
                 self.rewrite_block(body, &mut closure_vars);
             }
             Expr::Borrow(inner, _) => self.rewrite_expr(inner, var_types),
+            Expr::EnumTag(e) => self.rewrite_expr(e, var_types),
+            Expr::EnumVariantTag(_) => {}
+            Expr::EnumField(e, _, _) => self.rewrite_expr(e, var_types),
             Expr::Call { name, args } => {
                 for arg in args.iter_mut() {
                     let inner = match arg {

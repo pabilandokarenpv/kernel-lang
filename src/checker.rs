@@ -81,6 +81,9 @@ fn expr_references(e: &Expr, name: &str) -> bool {
         }),
         Expr::ArrayLit(items) => items.iter().any(|e| expr_references(e, name)),
         Expr::Index(arr, idx) => expr_references(arr, name) || expr_references(idx, name),
+        Expr::EnumTag(e) => expr_references(e, name),
+        Expr::EnumVariantTag(_) => false,
+        Expr::EnumField(e, _, _) => expr_references(e, name),
         Expr::Closure { .. } => unreachable!("Kernel checker: Expr::Closure should always be erased by lambda_lift.rs before the checker runs"),
     }
 }
@@ -200,6 +203,16 @@ pub struct Checker {
     // reassigning an immutable global silently never actually took
     // effect, so this half of the check was never exercisable before).
     global_mutable: HashMap<String, bool>,
+    // Real tagged-union enums (v1.x) -- see EnumDecl's doc comment in
+    // ast.rs for the full design/scope. `enums` is the declarations
+    // themselves (enum name -> decl); `variant_info` is the flattened,
+    // GLOBALLY-keyed lookup every variant name resolves through (variant
+    // name -> (its enum's name, its own declared index, its field
+    // types)) -- variant names must be unique across every enum in the
+    // whole program (Kernel has no `::` to disambiguate otherwise), so a
+    // single flat map is sufficient and correct.
+    enums: HashMap<String, EnumDecl>,
+    variant_info: HashMap<String, (String, usize, Vec<String>)>,
 }
 
 impl Checker {
@@ -207,6 +220,9 @@ impl Checker {
         let mut structs = HashSet::new();
         let mut functions = HashMap::new();
         let mut global_mutable = HashMap::new();
+        let mut enums = HashMap::new();
+        let mut variant_info: HashMap<String, (String, usize, Vec<String>)> = HashMap::new();
+        let mut variant_collisions = Vec::new();
         for item in &program.items {
             match item {
                 Item::Struct(s) => {
@@ -221,10 +237,27 @@ impl Checker {
                 Item::Const { name, .. } => {
                     global_mutable.insert(name.clone(), false);
                 }
+                Item::Enum(e) => {
+                    for (idx, (variant_name, field_types)) in e.variants.iter().enumerate() {
+                        if variant_info.contains_key(variant_name) {
+                            variant_collisions.push(variant_name.clone());
+                        }
+                        variant_info.insert(variant_name.clone(), (e.name.clone(), idx, field_types.clone()));
+                    }
+                    enums.insert(e.name.clone(), e.clone());
+                }
                 _ => {}
             }
         }
-        Checker { structs, functions, errors: Vec::new(), borrow_stack: Vec::new(), global_mutable }
+        let mut errors = Vec::new();
+        for name in variant_collisions {
+            errors.push(format!(
+                "cannot declare variant `{}` -- that name is already used by another enum's variant; \
+                 Kernel has no `::`-qualified paths, so every variant name must be globally unique",
+                name
+            ));
+        }
+        Checker { structs, functions, errors, borrow_stack: Vec::new(), global_mutable, enums, variant_info }
     }
 
     pub fn check(mut self, program: &Program) -> Vec<String> {
@@ -232,7 +265,7 @@ impl Checker {
             if let Item::Function(f) = item {
                 let mut scope: HashMap<String, VarState> = HashMap::new();
                 for p in &f.params {
-                    let copy = p.borrowed || (!self.structs.contains(&p.ty) && !is_array_type(&p.ty) && !is_vec_type(&p.ty));
+                    let copy = p.borrowed || (!self.structs.contains(&p.ty) && !is_array_type(&p.ty) && !is_vec_type(&p.ty) && !self.enums.contains_key(&p.ty));
                     let ref_exclusive = if p.borrowed { Some(p.exclusive) } else { None };
                     scope.insert(p.name.clone(), VarState { copy, moved: false, shared_borrows: 0, exclusive_borrow: false, declared_mut: true, ref_exclusive });
                 }
@@ -249,6 +282,11 @@ impl Checker {
             Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) => true,
             Expr::Ident(name) => scope.get(name).map(|s| s.copy).unwrap_or(true),
             Expr::Binary(..) | Expr::Unary(..) | Expr::Field(..) | Expr::Borrow(..) | Expr::Range(..) | Expr::Index(..) => true,
+            // Both always produce a plain int (a tag/tag-constant), and
+            // EnumField is restricted to primitive-only payload fields
+            // (see EnumDecl's doc comment) -- every one of those is
+            // already Copy, so all three are unconditionally Copy too.
+            Expr::EnumTag(_) | Expr::EnumVariantTag(_) | Expr::EnumField(..) => true,
             // A fresh array literal is a newly-constructed owned compound
             // value, same treatment as struct construction below -- moving
             // it moves the whole array, matching real ownership semantics.
@@ -262,9 +300,16 @@ impl Checker {
                     false
                 } else if self.structs.contains(name) {
                     false
+                } else if self.variant_info.contains_key(name) {
+                    // A freshly-constructed enum variant -- same
+                    // treatment as struct construction. Applies
+                    // uniformly to zero-field variants too (`Empty()`
+                    // is still call syntax for a mixed enum, see
+                    // EnumDecl's doc comment).
+                    false
                 } else if let Some(f) = self.functions.get(name) {
                     match &f.return_ty {
-                        Some(t) if self.structs.contains(t) || is_array_type(t) || is_vec_type(t) => false,
+                        Some(t) if self.structs.contains(t) || is_array_type(t) || is_vec_type(t) || self.enums.contains_key(t) => false,
                         _ => true,
                     }
                 } else {
@@ -683,6 +728,26 @@ impl Checker {
                 // still just reads the inner value; nothing persists.
                 self.check_expr(inner, scope, unsafe_ctx, fn_name);
             }
+            Expr::EnumTag(e) => self.check_expr(e, scope, unsafe_ctx, fn_name),
+            Expr::EnumVariantTag(variant_name) => {
+                if !self.variant_info.contains_key(variant_name) {
+                    self.errors.push(format!("[{}] unknown enum variant `{}`", fn_name, variant_name));
+                }
+            }
+            Expr::EnumField(e, variant_name, idx) => {
+                self.check_expr(e, scope, unsafe_ctx, fn_name);
+                match self.variant_info.get(variant_name) {
+                    Some((_, _, field_types)) => {
+                        if *idx >= field_types.len() {
+                            self.errors.push(format!(
+                                "[{}] variant `{}` has no field at index {}",
+                                fn_name, variant_name, idx
+                            ));
+                        }
+                    }
+                    None => self.errors.push(format!("[{}] unknown enum variant `{}`", fn_name, variant_name)),
+                }
+            }
             Expr::Call { name, args } => {
                 if self.is_unsafe_call(name) && !unsafe_ctx {
                     self.errors.push(format!(
@@ -746,6 +811,26 @@ impl Checker {
                         }
                     }
                     return;
+                }
+                // Enum variant CONSTRUCTION (`Circle(5)`, `Empty()`) --
+                // see EnumDecl's doc comment in ast.rs. Validated here
+                // (arg count, positional-only); the generic move/borrow-
+                // tracking loop below still runs over its args normally
+                // afterward (no `return` here), same as struct
+                // construction gets no special early-exit either.
+                if let Some((_, _, field_types)) = self.variant_info.get(name) {
+                    if args.len() != field_types.len() {
+                        self.errors.push(format!(
+                            "[{}] `{}` takes {} field(s), found {} argument(s)",
+                            fn_name, name, field_types.len(), args.len()
+                        ));
+                    }
+                    if args.iter().any(|a| matches!(a, CallArg::Named(..))) {
+                        self.errors.push(format!(
+                            "[{}] enum variant `{}` takes positional arguments only (no `name: value` syntax)",
+                            fn_name, name
+                        ));
+                    }
                 }
                 // Ephemeral borrows taken as THIS call's own arguments --
                 // live only for evaluating this one call, so conflicts are

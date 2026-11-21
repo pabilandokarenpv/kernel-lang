@@ -35,6 +35,28 @@ fn array_info(c_ty: &str) -> Option<(String, i64)> {
     Some((elem, n))
 }
 
+// Maps a Kernel primitive type to the `KernelEnumSlot` union member that
+// correctly stores it (see generate()'s enum-struct typedef) -- the
+// SAME mapping used at both a variant's CONSTRUCTION (call_expr) and
+// its field EXTRACTION (expr()'s Expr::EnumField arm), so a field
+// always round-trips through the exact union member its own declared
+// type calls for. Panics on anything else, matching EnumDecl's
+// primitive-only payload scope in ast.rs -- never silently picks a
+// wrong-width member.
+fn enum_slot_member(kernel_ty: &str) -> &'static str {
+    match kernel_ty.trim() {
+        "int" => "i",
+        "float" => "f",
+        "str" => "s",
+        "bool" => "b",
+        other => panic!(
+            "Kernel codegen: enum variant field type `{}` isn't a supported payload type in v1.x \
+             (int/float/str/bool only -- see EnumDecl's doc comment in ast.rs)",
+            other
+        ),
+    }
+}
+
 pub struct Codegen {
     structs: HashSet<String>,
     functions: HashMap<String, FnDecl>,
@@ -55,6 +77,18 @@ pub struct Codegen {
     // checking against this backend, not something anyone wrote a test
     // for on purpose).
     global_types: HashMap<String, String>,
+    // Real tagged-union enums (v1.x) -- see EnumDecl's doc comment in
+    // ast.rs. Same split as checker.rs/interpreter.rs's own fields.
+    // `max_arity` is the largest field count across EVERY enum variant
+    // in the whole program -- used as every enum struct's fixed
+    // `data[N]` slot-array size (see c_type's enum branch and the
+    // generated `KernelEnumSlot` union emitted by generate()). A single
+    // global max (not per-enum) keeps the generated C simpler -- a
+    // handful of wasted union slots on a small-arity enum costs nothing
+    // real on this target.
+    enums: HashMap<String, EnumDecl>,
+    variant_info: HashMap<String, (String, usize, Vec<String>)>,
+    max_arity: usize,
 }
 
 impl Codegen {
@@ -63,6 +97,9 @@ impl Codegen {
         let mut functions = HashMap::new();
         let mut struct_fields = HashMap::new();
         let mut global_types = HashMap::new();
+        let mut enums = HashMap::new();
+        let mut variant_info: HashMap<String, (String, usize, Vec<String>)> = HashMap::new();
+        let mut max_arity = 0;
         for item in &program.items {
             match item {
                 Item::Struct(s) => {
@@ -78,10 +115,17 @@ impl Codegen {
                 Item::Static { name, ty, .. } | Item::Const { name, ty, .. } => {
                     global_types.insert(name.clone(), ty.clone());
                 }
+                Item::Enum(e) => {
+                    for (idx, (variant_name, field_types)) in e.variants.iter().enumerate() {
+                        max_arity = max_arity.max(field_types.len());
+                        variant_info.insert(variant_name.clone(), (e.name.clone(), idx, field_types.clone()));
+                    }
+                    enums.insert(e.name.clone(), e.clone());
+                }
                 _ => {}
             }
         }
-        Codegen { structs, functions, struct_fields, global_types }
+        Codegen { structs, functions, struct_fields, global_types, enums, variant_info, max_arity: max_arity.max(1) }
     }
 
     fn c_type(&self, ty: &str) -> String {
@@ -108,6 +152,7 @@ impl Codegen {
             "str" => "const char*".to_string(),
             "bool" => "bool".to_string(),
             other if self.structs.contains(other) => format!("struct {}", other),
+            other if self.enums.contains_key(other) => format!("struct {}", other),
             _ => "long".to_string(),
         }
     }
@@ -214,6 +259,21 @@ impl Codegen {
             // "compile everything" sweep).
             Expr::Borrow(inner, _) => format!("{}*", self.infer_c_type(inner, var_types)),
             Expr::Range(..) => "long".to_string(),
+            Expr::EnumTag(_) => "long".to_string(),
+            Expr::EnumVariantTag(_) => "long".to_string(),
+            Expr::EnumField(_, variant_name, idx) => {
+                // The field's declared Kernel type, resolved from the
+                // variant's own field-type list (known statically from
+                // the match arm that produced this node) -- NOT the raw
+                // union slot type, since different fields of the SAME
+                // variant can need different C types read back out of
+                // the uniform `KernelEnumSlot` storage (see generate()'s
+                // enum-struct typedef and gen_enum_field_access below).
+                match self.variant_info.get(variant_name) {
+                    Some((_, _, field_types)) => field_types.get(*idx).map(|t| self.c_type(t)).unwrap_or_else(|| "long".to_string()),
+                    None => "long".to_string(),
+                }
+            }
             Expr::Call { name, args } => {
                 if name == "abs" {
                     return args.first().map(|a| match a {
@@ -222,6 +282,8 @@ impl Codegen {
                 }
                 if self.structs.contains(name) {
                     format!("struct {}", name)
+                } else if let Some((enum_name, _, _)) = self.variant_info.get(name) {
+                    format!("struct {}", enum_name)
                 } else if let Some(f) = self.functions.get(name) {
                     match &f.return_ty {
                         Some(t) => self.c_type(t),
@@ -250,6 +312,25 @@ impl Codegen {
         out.push_str("const char *kernel_strcat(const char *a, const char *b);\n");
         out.push_str("long kernel_strlen(const char *s);\n");
         out.push_str("_Noreturn void kernel_panic(const char *msg);\n\n");
+
+        // Real tagged-union enum support (v1.x) -- see EnumDecl's doc
+        // comment in ast.rs. `KernelEnumSlot` is a real C union: lets
+        // ONE fixed-size storage slot correctly hold whichever primitive
+        // type a given field actually needs (int/float/str-pointer/bool)
+        // without wasting space on a worst-case-width `long[]` array AND
+        // without needing to know each slot's type until the one place
+        // that actually reads it back (gen_enum_field_access) -- C's
+        // union does the platform-correct sizing/alignment for us (the
+        // same reason the project's LLVM-native Vec<T> uses real
+        // TargetData ABI queries rather than a hand-guessed width).
+        if !self.enums.is_empty() {
+            out.push_str("typedef union {\n    long i;\n    double f;\n    const char* s;\n    bool b;\n} KernelEnumSlot;\n\n");
+            for item in &program.items {
+                if let Item::Enum(e) = item {
+                    out.push_str(&format!("struct {} {{\n    int tag;\n    KernelEnumSlot data[{}];\n}};\n\n", e.name, self.max_arity));
+                }
+            }
+        }
 
         // struct definitions
         for item in &program.items {
@@ -477,6 +558,22 @@ impl Codegen {
                 }
             }
             Expr::Borrow(inner, _exclusive) => format!("(&{})", self.expr(inner, is_ptr, var_types)),
+            Expr::EnumTag(e) => format!("({}).tag", self.expr(e, is_ptr, var_types)),
+            Expr::EnumVariantTag(variant_name) => {
+                match self.variant_info.get(variant_name) {
+                    Some((_, idx, _)) => idx.to_string(),
+                    None => panic!("Kernel codegen: unknown enum variant `{}`", variant_name),
+                }
+            }
+            Expr::EnumField(scrutinee, variant_name, idx) => {
+                let field_ty = self
+                    .variant_info
+                    .get(variant_name)
+                    .and_then(|(_, _, field_types)| field_types.get(*idx))
+                    .unwrap_or_else(|| panic!("Kernel codegen: variant `{}` has no field at index {}", variant_name, idx));
+                let member = enum_slot_member(field_ty);
+                format!("({}).data[{}].{}", self.expr(scrutinee, is_ptr, var_types), idx, member)
+            }
             Expr::Closure { .. } => unreachable!("Kernel codegen: Expr::Closure should always be erased by lambda_lift.rs before codegen runs"),
             Expr::Call { name, args } => self.call_expr(name, args, is_ptr, var_types),
         }
@@ -542,6 +639,28 @@ impl Codegen {
                     })
                     .collect();
                 format!("(struct {}){{{}}}", name, fields.join(", "))
+            }
+            _ if self.variant_info.contains_key(name) => {
+                // Enum variant construction, e.g. Circle(5), Empty() --
+                // see EnumDecl's doc comment in ast.rs. A C99 designated
+                // initializer with a per-field union-member pick (see
+                // enum_slot_member) -- any trailing `data[]` slots beyond
+                // the ones given are zero-initialized automatically by
+                // C's own aggregate-initializer rules, no explicit
+                // padding needed.
+                let (enum_name, idx, field_types) = self.variant_info.get(name).unwrap();
+                let slots: Vec<String> = args
+                    .iter()
+                    .zip(field_types.iter())
+                    .map(|(a, fty)| {
+                        let e = match a {
+                            CallArg::Positional(e) | CallArg::Named(_, e) => e,
+                        };
+                        let member = enum_slot_member(fty);
+                        format!("{{.{} = {}}}", member, self.expr(e, is_ptr, var_types))
+                    })
+                    .collect();
+                format!("(struct {}){{.tag = {}, .data = {{{}}}}}", enum_name, idx, slots.join(", "))
             }
             _ => {
                 let joined: Vec<String> = args.iter().map(|a| self.call_arg(a, is_ptr, var_types)).collect();
@@ -720,6 +839,17 @@ impl Codegen {
                 CallArg::Named(_, e) => e,
             };
             let ty = self.infer_c_type(e, var_types);
+            // Printing a whole enum value (or struct/array, pre-existing
+            // narrower gaps not fixed here) would otherwise silently fall
+            // through to kernel_print_long on raw struct bytes -- a real
+            // miscompile, not just an unsupported-but-loud case. Reject
+            // it explicitly, matching the interpreter's identical guard.
+            if self.enums.values().any(|en| ty == format!("struct {}", en.name)) {
+                panic!(
+                    "Kernel codegen: `print()` on a whole enum value isn't supported in v1.x -- \
+                     match on it and print its extracted fields instead"
+                );
+            }
             let helper = match ty.as_str() {
                 "const char*" => "kernel_print_str",
                 "bool" => "kernel_print_bool",

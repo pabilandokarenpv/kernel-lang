@@ -126,12 +126,22 @@ pub struct LlvmCodegen<'ctx> {
     struct_types: HashMap<String, StructType<'ctx>>,
     functions: HashMap<String, FnDecl>,
     printf_fn: FunctionValue<'ctx>,
-    // Top-level `static`/`const` items (includes desugared enum variants --
-    // see parser.rs's parse_enum_desugared) are plain LLVM globals, not
-    // locals -- this is their Kernel type, the global-scope twin of
-    // FnCtx::var_types, consulted wherever a local lookup misses (see
-    // var_addr/var_kernel_type below).
+    // Top-level `static`/`const` items (includes desugared flat-int enum
+    // variants for an ALL-zero-field enum -- see parser.rs's parse_enum)
+    // are plain LLVM globals, not locals -- this is their Kernel type,
+    // the global-scope twin of FnCtx::var_types, consulted wherever a
+    // local lookup misses (see var_addr/var_kernel_type below).
     global_types: HashMap<String, String>,
+    // Real tagged-union enums (v1.x) -- see EnumDecl's doc comment in
+    // ast.rs. Same split as checker.rs/interpreter.rs/codegen_c.rs's own
+    // fields; `enum_types` is this backend's twin of `struct_types`
+    // (named LLVM struct type per enum); `max_arity` is the largest
+    // field count across every variant in the whole program, same
+    // single-global-max reasoning as codegen_c.rs's own max_arity.
+    enums: HashMap<String, EnumDecl>,
+    variant_info: HashMap<String, (String, usize, Vec<String>)>,
+    enum_types: HashMap<String, StructType<'ctx>>,
+    max_arity: u32,
     // Real ABI-size queries for Vec<T>'s realloc sizing (vec_elem_byte_size)
     // -- needed for element types beyond the hand-known primitives
     // (structs, fixed-size arrays, nested Vecs). Owned by compile_to_object's
@@ -187,6 +197,10 @@ impl<'ctx> LlvmCodegen<'ctx> {
             functions: HashMap::new(),
             printf_fn,
             global_types: HashMap::new(),
+            enums: HashMap::new(),
+            variant_info: HashMap::new(),
+            enum_types: HashMap::new(),
+            max_arity: 1,
             target_data,
         }
     }
@@ -240,6 +254,7 @@ impl<'ctx> LlvmCodegen<'ctx> {
             "bool" => self.context.bool_type().into(),
             "str" => self.ptr_type().into(),
             other if self.struct_types.contains_key(other) => self.struct_types[other].into(),
+            other if self.enum_types.contains_key(other) => self.enum_types[other].into(),
             other => panic!("Kernel LLVM codegen: unknown type `{}`", other),
         }
     }
@@ -261,6 +276,45 @@ impl<'ctx> LlvmCodegen<'ctx> {
             "bool" => 1,
             "str" => 8, // a pointer
             other => self.target_data.get_abi_size(&self.llvm_type(other)),
+        }
+    }
+
+    // Converts a real-typed field value DOWN into the uniform i64 slot
+    // storage an enum's `data[]` array uses (see generate()'s enum
+    // struct-type construction) -- the construction-time half of the
+    // pair, mirrored by enum_slot_from_i64 below for field extraction.
+    // int needs nothing (already i64); bool zero-extends; float/str
+    // reinterpret their bits into an i64 via bitcast/ptrtoint (lossless
+    // -- every supported type here is exactly 8 bytes or narrower, see
+    // EnumDecl's primitive-only payload scope in ast.rs).
+    fn enum_slot_to_i64(&self, val: BasicValueEnum<'ctx>, kernel_ty: &str) -> inkwell::values::IntValue<'ctx> {
+        match kernel_ty.trim() {
+            "int" => val.into_int_value(),
+            "bool" => self.builder.build_int_z_extend(val.into_int_value(), self.context.i64_type(), "boolext").unwrap(),
+            "float" => self.builder.build_bit_cast(val.into_float_value(), self.context.i64_type(), "floatbits").unwrap().into_int_value(),
+            "str" => self.builder.build_ptr_to_int(val.into_pointer_value(), self.context.i64_type(), "ptrbits").unwrap(),
+            other => panic!(
+                "Kernel LLVM codegen: enum variant field type `{}` isn't a supported payload type in v1.x \
+                 (int/float/str/bool only -- see EnumDecl's doc comment in ast.rs)",
+                other
+            ),
+        }
+    }
+
+    // The inverse of enum_slot_to_i64 -- reconstructs the field's real
+    // typed value from its raw i64 slot at field-EXTRACTION time
+    // (Expr::EnumField's codegen).
+    fn enum_slot_from_i64(&self, slot: inkwell::values::IntValue<'ctx>, kernel_ty: &str) -> BasicValueEnum<'ctx> {
+        match kernel_ty.trim() {
+            "int" => slot.into(),
+            "bool" => self.builder.build_int_truncate(slot, self.context.bool_type(), "booltrunc").unwrap().into(),
+            "float" => self.builder.build_bit_cast(slot, self.context.f64_type(), "floatval").unwrap(),
+            "str" => self.builder.build_int_to_ptr(slot, self.ptr_type(), "ptrval").unwrap().into(),
+            other => panic!(
+                "Kernel LLVM codegen: enum variant field type `{}` isn't a supported payload type in v1.x \
+                 (int/float/str/bool only -- see EnumDecl's doc comment in ast.rs)",
+                other
+            ),
         }
     }
 
@@ -345,6 +399,15 @@ impl<'ctx> LlvmCodegen<'ctx> {
                     .unwrap_or_else(|| "int".to_string())
             }
             Expr::Borrow(inner, _) => format!("&{}", self.infer_kernel_type(inner, ctx)),
+            Expr::EnumTag(_) => "int".to_string(),
+            Expr::EnumVariantTag(_) => "int".to_string(),
+            Expr::EnumField(_, variant_name, idx) => {
+                self.variant_info
+                    .get(variant_name)
+                    .and_then(|(_, _, field_types)| field_types.get(*idx))
+                    .cloned()
+                    .unwrap_or_else(|| "int".to_string())
+            }
             Expr::Call { name, args } => {
                 if name == "abs" {
                     return args.first().map(|a| self.infer_kernel_type(arg_expr(a), ctx)).unwrap_or_else(|| "int".to_string());
@@ -386,6 +449,8 @@ impl<'ctx> LlvmCodegen<'ctx> {
                 }
                 if self.structs.contains(name) {
                     name.clone()
+                } else if let Some((enum_name, _, _)) = self.variant_info.get(name) {
+                    enum_name.clone()
                 } else if let Some(f) = self.functions.get(name) {
                     f.return_ty.clone().unwrap_or_else(|| "int".to_string())
                 } else {
@@ -421,6 +486,33 @@ impl<'ctx> LlvmCodegen<'ctx> {
             if let Item::Struct(s) = item {
                 let field_types: Vec<BasicTypeEnum> = s.fields.iter().map(|(_, t)| self.llvm_type(t)).collect();
                 self.struct_types[&s.name].set_body(&field_types, false);
+            }
+        }
+        // Real tagged-union enums (v1.x) -- see EnumDecl's doc comment in
+        // ast.rs. Compute max_arity across the WHOLE program first (the
+        // single global data[] size every enum struct shares, same
+        // reasoning as codegen_c.rs's own max_arity), then build each
+        // enum's real LLVM struct type: { tag: i32, data: [max_arity x i64] }
+        // -- i64 slots used purely as fixed-width raw storage (opaque
+        // pointers mean no cast is needed to load/store a DIFFERENT real
+        // type through the same slot address, see gen_enum_field_store/
+        // gen_enum_field_load).
+        for item in &program.items {
+            if let Item::Enum(e) = item {
+                for (idx, (variant_name, field_types)) in e.variants.iter().enumerate() {
+                    self.max_arity = self.max_arity.max(field_types.len() as u32);
+                    self.variant_info.insert(variant_name.clone(), (e.name.clone(), idx, field_types.clone()));
+                }
+                self.enums.insert(e.name.clone(), e.clone());
+            }
+        }
+        for item in &program.items {
+            if let Item::Enum(e) = item {
+                let ty = self.context.struct_type(
+                    &[self.context.i64_type().into(), self.context.i64_type().array_type(self.max_arity).into()],
+                    false,
+                );
+                self.enum_types.insert(e.name.clone(), ty);
             }
         }
         for item in &program.items {
@@ -981,6 +1073,30 @@ impl<'ctx> LlvmCodegen<'ctx> {
                 self.builder.build_load(self.llvm_type(&field_ty), addr, "fieldval").unwrap()
             }
             Expr::Borrow(_, _) => self.gen_addr(e, ctx).into(),
+            Expr::EnumTag(scrutinee) => {
+                let val = self.gen_expr(scrutinee, ctx).into_struct_value();
+                self.builder.build_extract_value(val, 0, "tag").unwrap()
+            }
+            Expr::EnumVariantTag(variant_name) => {
+                let (_, idx, _) = self
+                    .variant_info
+                    .get(variant_name)
+                    .unwrap_or_else(|| panic!("Kernel LLVM codegen: unknown enum variant `{}`", variant_name));
+                self.context.i64_type().const_int(*idx as u64, false).into()
+            }
+            Expr::EnumField(scrutinee, variant_name, idx) => {
+                let (_, _, field_types) = self
+                    .variant_info
+                    .get(variant_name)
+                    .unwrap_or_else(|| panic!("Kernel LLVM codegen: unknown enum variant `{}`", variant_name));
+                let field_ty = field_types
+                    .get(*idx)
+                    .unwrap_or_else(|| panic!("Kernel LLVM codegen: variant `{}` has no field at index {}", variant_name, idx));
+                let val = self.gen_expr(scrutinee, ctx).into_struct_value();
+                let data = self.builder.build_extract_value(val, 1, "data").unwrap().into_array_value();
+                let slot = self.builder.build_extract_value(data, *idx as u32, "slot").unwrap().into_int_value();
+                self.enum_slot_from_i64(slot, field_ty)
+            }
             Expr::Call { name, args } => self.gen_call(name, args, ctx),
             Expr::ArrayLit(elems) => {
                 let elem_ty = elems.first().map(|el| self.infer_kernel_type(el, ctx)).unwrap_or_else(|| "int".to_string());
@@ -1214,6 +1330,32 @@ impl<'ctx> LlvmCodegen<'ctx> {
                 }
                 agg.into()
             }
+            _ if self.variant_info.contains_key(name) => {
+                // Enum variant construction, e.g. Circle(5), Empty() --
+                // see EnumDecl's doc comment in ast.rs. Builds the
+                // { tag, data[] } aggregate purely via insert_value chains
+                // (no alloca needed, same SSA-register construction
+                // struct literals already use above) -- each field value
+                // is first squeezed down to its uniform i64 slot
+                // representation via enum_slot_to_i64 before being
+                // inserted into the data array, since insert_value
+                // requires the exact declared element type (i64) at
+                // that position, not the field's own real type.
+                let (enum_name, idx, field_types) = self.variant_info.get(name).unwrap().clone();
+                let enum_ty = self.enum_types[&enum_name];
+                let array_ty = self.context.i64_type().array_type(self.max_arity);
+                let mut data_arr = array_ty.get_undef();
+                for (i, (a, fty)) in args.iter().zip(field_types.iter()).enumerate() {
+                    let e = arg_expr(a);
+                    let val = self.gen_expr(e, ctx);
+                    let slot = self.enum_slot_to_i64(val, fty);
+                    data_arr = self.builder.build_insert_value(data_arr, slot, i as u32, "slot").unwrap().into_array_value();
+                }
+                let mut agg = enum_ty.get_undef();
+                agg = self.builder.build_insert_value(agg, self.context.i64_type().const_int(idx as u64, false), 0, "tag").unwrap().into_struct_value();
+                agg = self.builder.build_insert_value(agg, data_arr, 1, "data").unwrap().into_struct_value();
+                agg.into()
+            }
             _ => {
                 let callee = self.module.get_function(name).unwrap();
                 // No special-casing by the callee's declared borrowedness
@@ -1409,6 +1551,17 @@ impl<'ctx> LlvmCodegen<'ctx> {
             }
             let e = arg_expr(a);
             let ty = self.infer_kernel_type(e, ctx);
+            // Printing a whole enum value would otherwise fall into the
+            // `_ => "%ld"` default below and pass a struct aggregate
+            // where printf expects a long -- a real miscompile, not
+            // just unsupported. Reject it explicitly, matching the
+            // interpreter's and C backend's identical guard.
+            if self.enums.contains_key(&ty) {
+                panic!(
+                    "Kernel LLVM codegen: `print()` on a whole enum value isn't supported in v1.x -- \
+                     match on it and print its extracted fields instead"
+                );
+            }
             match ty.as_str() {
                 "str" => {
                     fmt.push_str("%s");

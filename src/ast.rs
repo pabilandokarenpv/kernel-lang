@@ -31,6 +31,66 @@ pub enum Item {
     // lambda_lift.rs never see this variant -- it's always gone by the
     // time any of them run.
     Import(String),
+    // A REAL tagged-union enum (v1.x, added as a follow-up to the earlier
+    // C-style-only `enum` -- see EnumDecl's own doc comment for the full
+    // design). Unlike Item::Import/the old flat-int-const desugaring,
+    // this is NOT erased before the checker/interpreter/codegen run --
+    // it's a genuinely new runtime type, same "real value, not an
+    // erasure" treatment Vec<T> got.
+    Enum(EnumDecl),
+}
+
+#[derive(Debug, Clone)]
+// A tagged-union enum: a fixed, named set of VARIANTS, each optionally
+// carrying its own typed payload fields (tuple-style, positional --
+// matches Rust's `Variant(T, U)` shape, not a struct-style `Variant { x:
+// T }` one, since Kernel has no need for named fields on something this
+// small and it keeps construction syntax uniform with everything else
+// that already uses positional/named call-style construction).
+//
+// Honest v1.x scope, stated once here rather than repeated at every call
+// site downstream:
+//   - Payload fields are PRIMITIVES ONLY (int/float/bool/str) -- no
+//     struct/array/Vec/nested-enum payloads. Every backend's runtime
+//     representation (a fixed-width tagged union -- literally a C
+//     `union` in codegen_c.rs, a raw `[N x i64]` bit-storage array in
+//     codegen_llvm.rs) depends on this; lifting it to arbitrary payload
+//     types would need real size/alignment-aware layout, not just a
+//     wider union member, and is named future work, not silently
+//     miscompiled.
+//   - Variant names must be GLOBALLY unique across every enum in the
+//     whole program (checker-enforced, a clear error on collision) --
+//     Kernel has no `::`-qualified paths to disambiguate `Enum1::X` from
+//     `Enum2::X` the way Rust can, so a bare `X` must unambiguously mean
+//     one specific variant of one specific enum everywhere it's written.
+//   - If EVERY variant of an enum has zero fields, it's handled by the
+//     OLD, pre-existing flat-int-const desugar (parser.rs) completely
+//     unchanged -- `enum Color: Red / Green / Blue` with bare `Red`/
+//     `Green` usage (examples/enums.kn, match_test.kn, predate this
+//     feature) keeps working byte-for-byte identically; this EnumDecl
+//     type is never even constructed for them.
+//   - Construction for a MIXED enum (at least one variant carries a
+//     field) is ALWAYS call syntax, for EVERY variant regardless of its
+//     own arity -- `Circle(5)` AND `Empty()`, never a bare `Empty`.
+//     Deliberately uniform rather than Rust's own "bare unit variant"
+//     convention: keeps every mixed-enum variant construction/pattern
+//     the same shape (tag+field comparison, see Expr::EnumTag/
+//     Expr::EnumField in ast.rs) with NO need for enum-value
+//     structural equality (`==` between two full enum values) anywhere
+//     in checker/interpreter/codegen -- a real simplification, not an
+//     oversight, named here once rather than re-derived at every call
+//     site downstream.
+//   - No exhaustiveness checking on `match` (same honest gap as
+//     struct/array field access generally -- v1.x's checker doesn't do
+//     full control-flow-sensitive analysis anywhere yet, see ARD-003) --
+//     an unmatched variant at runtime simply falls through to the
+//     wildcard arm if present, or executes no arm's body at all if not
+//     (never a panic, same as a `match` that falls through today).
+//   - Enum values are move-by-default (non-Copy), exactly like structs
+//     and arrays -- moving one moves the whole tagged value.
+pub struct EnumDecl {
+    pub name: String,
+    pub variants: Vec<(String, Vec<String>)>, // (variant name, field types, in order)
 }
 
 #[derive(Debug, Clone)]
@@ -167,6 +227,33 @@ pub enum Expr {
     //     for compound types is named future work, not implemented here.
     //   - No recursive closures (a closure can't call itself by name).
     Closure { params: Vec<Param>, return_ty: Option<String>, body: Vec<Stmt> },
+    // Synthesized ONLY by parser.rs's match-desugaring for an enum-variant
+    // pattern (`match s: Circle(r): ...`) -- never written directly in
+    // source. Extracts the scrutinee's tag as an int so the desugared
+    // `if` can compare it against the matched variant's known index.
+    // Kept as a real typed Expr (not a fake builtin-function call) so
+    // every backend's existing type-inference machinery already knows
+    // what to do with a plain int-returning expression.
+    EnumTag(Box<Expr>),
+    // The compile/interpret-time-resolved tag CONSTANT for a named
+    // variant (e.g. `EnumVariantTag("Circle")` -> whatever index
+    // `Circle` was declared at in its enum, an int). Synthesized ONLY
+    // by match-desugaring, as the right-hand side of an `EnumTag(...)
+    // == EnumVariantTag(...)` comparison -- never written directly in
+    // source, and deliberately a DIFFERENT node than EnumTag (which
+    // reads a VALUE's tag at runtime): this one names a variant
+    // directly, with no scrutinee expression to evaluate at all. Every
+    // backend resolves it via the same variant-lookup table it already
+    // needs for construction validation, so this adds no new lookup
+    // machinery, just a new place that calls into it.
+    EnumVariantTag(String),
+    // Synthesized ONLY by parser.rs's match-desugaring, one per pattern
+    // binding (`Circle(r)` makes one `EnumField(scrutinee, "Circle", 0)`
+    // bound to `r` via a synthesized `let`). `variant`+`index` together
+    // resolve the field's real Kernel type at check/codegen time (the
+    // SAME field index means a different type under a different
+    // variant, so both are needed, not just the index alone).
+    EnumField(Box<Expr>, String, usize),
 }
 
 #[derive(Debug, Clone)]

@@ -1,0 +1,10 @@
+enum Shape:
+    Rect(int, int)
+
+fn take(s: Shape):
+    print(1)
+
+fn main():
+    let r = Rect(3, 7)
+    take(r)
+    take(r)

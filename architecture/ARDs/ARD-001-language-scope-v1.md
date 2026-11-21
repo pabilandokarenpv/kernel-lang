@@ -76,5 +76,15 @@ philosophy. Traits and Rust-style tagged-union enums with associated data
 remain genuinely out of scope, unchanged from the original decision. A
 real growable collection (`Vec<T>`) was also added, with real codegen on
 the interpreter and the LLVM native backend (ARD-006) -- the freestanding
-C backend explicitly rejects it (no heap allocator). See RFC-002's "v1.x
-additions" section for the full, current, honest scope of each.
+C backend explicitly rejects it (no heap allocator). Real Rust-style
+TAGGED-UNION enums (variants carrying typed payload fields, e.g. `enum
+Shape: Circle(int) / Rect(int, int)`) were added as well, closing the
+"Rust-style enums... remain out of v1's scope" gap named two sentences
+above -- a real runtime type on ALL THREE backends (not erased, same
+treatment `Vec<T>` got), deliberately scoped to primitive-only payload
+fields and globally-unique variant names (see RFC-002/RFC-003 for the
+full design and each backend's layout). An enum where every variant has
+zero fields is still handled by the OLD, unchanged C-style flat-int-const
+desugar -- this was purely additive, not a breaking change to the
+original mechanism. See RFC-002's "v1.x additions" section for the full,
+current, honest scope of each.
